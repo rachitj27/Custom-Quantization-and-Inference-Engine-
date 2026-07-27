@@ -407,7 +407,6 @@ std::vector<std::unique_ptr<Tensor>> run_forward(const Model& model, const Tenso
                         outputs[last_source]->num_elements);
         }
         
-       // std::cout << "  Layer " << arch.layer_id << " (" << arch.type << ") done" << std::endl;
         outputs[i] = std::move(result);
     }
     
