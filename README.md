@@ -8,7 +8,7 @@ The goal is to understand what production inference systems do internally by bui
 
 - [x] **M1: FP32 baseline** — trained YOLOv8n on the fire-8 dataset, benchmarked across four production runtimes
 - [x] **M2: From-scratch INT8 quantization** — implemented affine quantization, quantized matmul, and activation calibration end-to-end. Preserved 91% of FP32 mAP@0.5.
-- [x] **M3: Custom C++ inference engine** — hand-written engine that loads the quantized model and runs full YOLOv8n inference end-to-end. Validated against PyTorch reference.
+- [x] **M3: Custom C++ inference engine** — hand-written engine that loads the quantized model and runs full YOLOv8n inference end-to-end. Conv2d operator validated bit-level against PyTorch reference; end-to-end drift documented below.
 
 ## Model
 
@@ -44,6 +44,32 @@ Comparison of full inference on the same 640×640 image:
 
 Production runtimes are significantly faster because they use hardware-specific optimizations that my hand-written naive C++ does not. Closing this gap would require techniques like multi-threading and vectorization.
 
+The custom C++ engine performs a full quantized forward pass but accumulates numerical drift end-to-end; see the following section for details.
+
+### End-to-End Numerical Accuracy
+
+The C++ engine was validated at two levels: per-operator and end-to-end.
+
+**Per-operator (Layer 0 conv2d)** was compared bit-level against a PyTorch reference across 1.6M output values: 84.0% exact matches, 98.1% within ±1. This confirms the conv2d operator itself is numerically correct.
+
+**End-to-end** was measured by dumping intermediate activations at every network layer and comparing against the fake-quantized Python reference on the same test image:
+
+| Layer | % Within ±1 | MAE |
+|-------|-------------|-----|
+| L00 (first conv) | 38.3% | 9.0 |
+| L01 (second conv) | 33.6% | 6.6 |
+| L02 (first C2f) | 10.2% | 80.2 |
+| L15 (P3 output) | 17.6% | 15.3 |
+| L18 (P4 output) | 2.8% | 83.8 |
+| L21 (P5 output) | 1.1% | 132.4 |
+
+Drift grows sharply at layers containing C2f blocks. Two design decisions cause this:
+
+1. **Concat scale mixing.** YOLOv8n uses concat operations to merge feature maps at different points in the network. Each input to a concat is a quantized tensor at its own scale. The engine concatenates raw INT8 bytes without requantizing to a common scale — a production runtime like TensorRT inserts a requantization step here.
+2. **Per-module activation calibration.** Activation scales are calibrated at the output of each of the 22 top-level modules, not at every internal conv inside C2f and SPPF blocks. Internal convs use the block's output scale as an approximation. Per-conv calibration was attempted and did not materially reduce drift — Concat scale-mixing is the dominant source.
+
+The engine is intended as a portfolio piece to demonstrate the mechanics of quantized inference from first principles; closing this drift would require implementing common-scale requantization at every concat boundary.
+
 ## Approach
 
 **M2 (Quantization)** implements post-training static quantization from first principles rather than calling `torch.quantization`:
@@ -61,8 +87,6 @@ Production runtimes are significantly faster because they use hardware-specific 
 - Element-wise ops (Concat, Upsample, MaxPool)
 - Compound blocks (Bottleneck, C2f, SPPF) built from base operators
 - Forward pass runner that walks the model architecture
-
-The C++ engine's conv2d was validated against PyTorch's reference: 84% exact matches, 98% within ±1 across 1.6M output values.
 
 ## Repo Contents
 
