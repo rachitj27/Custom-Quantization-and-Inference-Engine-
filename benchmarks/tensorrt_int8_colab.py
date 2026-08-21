@@ -11,8 +11,15 @@ TensorRT FP16 number came from, then paste the printed table row into README.md.
     !python tensorrt_int8_colab.py --weights best.pt --data fire-8/data.yaml \\
         --images fire-8/test/images --labels fire-8/test/labels
 
-Calibration uses 100 training images, matching every other INT8 configuration in
-this repo so the comparison stays like-for-like.
+It also runs if you paste the whole file into a notebook cell -- unknown
+arguments (Jupyter injects its own "-f kernel-xxxx.json") are ignored, and the
+defaults above apply. To override paths from a cell:
+
+    main(["--weights", "best.pt", "--data", "fire-8/data.yaml",
+          "--images", "fire-8/test/images", "--labels", "fire-8/test/labels"])
+
+Calibration images come from the training split named in `data`, matching every
+other INT8 configuration in this repo so the comparison stays like-for-like.
 """
 
 import argparse
@@ -107,7 +114,7 @@ def decode(raw):
     return [(int(r[5]), float(r[4]), *r[:4]) for r in kept.tolist()]
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--weights", default="best.pt")
     ap.add_argument("--data", default="fire-8/data.yaml")
@@ -115,7 +122,12 @@ def main():
     ap.add_argument("--labels", default="fire-8/test/labels")
     ap.add_argument("--rounds", type=int, default=4)
     ap.add_argument("--timed-images", type=int, default=12)
-    args = ap.parse_args()
+
+    # Pasting this into a Colab cell means sys.argv carries the kernel's own
+    # "-f .../kernel-xxxx.json", which argparse would reject. Ignore unknown
+    # arguments so the script runs both as `!python tensorrt_int8_colab.py ...`
+    # and pasted straight into a notebook cell.
+    args, _unknown = ap.parse_known_args(argv)
 
     import torch
     from ultralytics import YOLO
@@ -124,21 +136,31 @@ def main():
         raise SystemExit("No CUDA device -- switch the Colab runtime to a T4 GPU.")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    # Ultralytics drives TensorRT's INT8 calibrator for us; `fraction` is sized
-    # to land on ~100 calibration images, matching the other INT8 configs here.
+    # Ultralytics drives TensorRT's INT8 calibrator for us, using images from
+    # `data` -- the same fire-8 training split the other INT8 configs calibrate on.
     print("Exporting INT8 TensorRT engine (takes several minutes)...")
-    engine_path = YOLO(args.weights).export(
-        format="engine", int8=True, data=args.data, imgsz=NET,
-        batch=1, workspace=4, verbose=False,
-    )
+    export_kwargs = dict(format="engine", int8=True, data=args.data,
+                         imgsz=NET, batch=1, workspace=4)
+    try:
+        engine_path = YOLO(args.weights).export(**export_kwargs)
+    except TypeError:
+        # Older/newer Ultralytics releases disagree on `workspace`.
+        export_kwargs.pop("workspace", None)
+        engine_path = YOLO(args.weights).export(**export_kwargs)
     print(f"Engine: {engine_path}")
 
     model = YOLO(engine_path, task="detect")
 
+    def to_input(batch):
+        """Ultralytics reads a raw numpy array as an HWC BGR image. Our batches
+        are already NCHW and normalised, so hand it a torch tensor instead --
+        that is the form it treats as pre-processed."""
+        return torch.from_numpy(batch).to("cuda")
+
     paths = sorted(glob.glob(os.path.join(args.images, "*.jpg")))
     if not paths:
         raise SystemExit(f"No images found in {args.images}")
-    batches = [preprocess(p) for p in paths[:args.timed_images]]
+    batches = [to_input(preprocess(p)) for p in paths[:args.timed_images]]
 
     for _ in range(10):
         model.predict(batches[0], verbose=False)
@@ -155,7 +177,8 @@ def main():
 
     preds_by_cls = {}
     for p in paths:
-        res = model.predict(preprocess(p), verbose=False, conf=CONF, iou=IOU)
+        res = model.predict(to_input(preprocess(p)), verbose=False,
+                            conf=CONF, iou=IOU)
         base = os.path.basename(p)
         for box in res[0].boxes:
             x1, y1, x2, y2 = box.xyxy[0].tolist()
