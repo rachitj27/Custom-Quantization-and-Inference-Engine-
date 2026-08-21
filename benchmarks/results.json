@@ -1,0 +1,86 @@
+[
+  {
+    "label": "PyTorch (Ultralytics) FP32",
+    "min_ms": 71.42799999928684,
+    "median_ms": 76.81100000081642,
+    "mean_ms": 77.19264999999116,
+    "map50": 0.8859062980030722,
+    "per_class": {
+      "fire": 0.7741935483870968,
+      "smoke": 0.9976190476190476
+    },
+    "n_samples": 48
+  },
+  {
+    "label": "ONNX Runtime FP32",
+    "min_ms": 36.42210000180057,
+    "median_ms": 44.11824999806413,
+    "mean_ms": 44.4477083331852,
+    "map50": 0.8859062980030722,
+    "per_class": {
+      "fire": 0.7741935483870968,
+      "smoke": 0.9976190476190476
+    },
+    "n_samples": 48
+  },
+  {
+    "label": "ONNX Runtime INT8",
+    "min_ms": 38.50370000145631,
+    "median_ms": 51.054699999440345,
+    "mean_ms": 51.70562499984044,
+    "map50": 0.8555754413202232,
+    "per_class": {
+      "fire": 0.7352150537634409,
+      "smoke": 0.9759358288770055
+    },
+    "n_samples": 48
+  },
+  {
+    "label": "OpenVINO FP32",
+    "min_ms": 30.353099999047117,
+    "median_ms": 31.676349999543163,
+    "mean_ms": 31.940397916590275,
+    "map50": 0.8859062980030722,
+    "per_class": {
+      "fire": 0.7741935483870968,
+      "smoke": 0.9976190476190476
+    },
+    "n_samples": 48
+  },
+  {
+    "label": "OpenVINO INT8",
+    "min_ms": 15.999700000975281,
+    "median_ms": 18.417249999401974,
+    "mean_ms": 18.849970833268042,
+    "map50": 0.8088771443610153,
+    "per_class": {
+      "fire": 0.7126260835938255,
+      "smoke": 0.9051282051282051
+    },
+    "n_samples": 48
+  },
+  {
+    "label": "Custom C++ engine (per-channel) INT8",
+    "min_ms": 5055.8,
+    "median_ms": 5257.9,
+    "mean_ms": 5257.9,
+    "map50": 0.8826,
+    "per_class": {
+      "fire": 0.7742,
+      "smoke": 0.9909
+    },
+    "note": "measured via cpp_engine/build/custom_engine --bench 4; mAP via quantization/eval_map.py over the full test set"
+  },
+  {
+    "label": "Custom C++ engine (per-tensor) INT8",
+    "min_ms": 5182.1,
+    "median_ms": 5407.5,
+    "mean_ms": 5407.5,
+    "map50": 0.768,
+    "per_class": {
+      "fire": 0.5935,
+      "smoke": 0.9426
+    },
+    "note": "original weight-quantization scheme, kept for comparison"
+  }
+]

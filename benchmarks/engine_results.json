@@ -1,0 +1,26 @@
+[
+  {
+    "label": "Custom C++ engine (per-channel) INT8",
+    "min_ms": 5055.8,
+    "median_ms": 5257.9,
+    "mean_ms": 5257.9,
+    "map50": 0.8826,
+    "per_class": {
+      "fire": 0.7742,
+      "smoke": 0.9909
+    },
+    "note": "measured via cpp_engine/build/custom_engine --bench 4; mAP via quantization/eval_map.py over the full test set"
+  },
+  {
+    "label": "Custom C++ engine (per-tensor) INT8",
+    "min_ms": 5182.1,
+    "median_ms": 5407.5,
+    "mean_ms": 5407.5,
+    "map50": 0.768,
+    "per_class": {
+      "fire": 0.5935,
+      "smoke": 0.9426
+    },
+    "note": "original weight-quantization scheme, kept for comparison"
+  }
+]
