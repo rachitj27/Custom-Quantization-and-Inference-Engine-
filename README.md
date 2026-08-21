@@ -74,8 +74,14 @@ Intel Core Ultra 7 256V, **on AC power**. Each runtime measured in its own proce
 | **OpenVINO** | **INT8** | **13.9 ms** | 16.4 ms | 0.8089 |
 | Custom C++ engine (per-channel) | INT8 | 3516.4 ms | 3537.1 ms | 0.8826 |
 | Custom C++ engine (per-tensor) | INT8 | 3418.1 ms | 3461.4 ms | 0.7680 |
-| TensorRT (NVIDIA T4, Colab) | FP16 | 12.4 ms | — | *carried over from M1* |
-| TensorRT (NVIDIA T4, Colab) | INT8 | *not measured* | — | — |
+
+GPU numbers are kept separate because a Tesla T4 is not comparable to a laptop CPU. Measured on Colab with the same preprocessing, NMS and mAP code:
+
+| Runtime | Precision | Best latency | Median | mAP@0.5 |
+|---------|-----------|--------------|--------|---------|
+| PyTorch (Ultralytics), T4 | FP32 | 8.0 ms | 8.1 ms | 0.8859 |
+| **TensorRT, T4** | **INT8** | **4.4 ms** | 5.1 ms | **0.0833** |
+| TensorRT, T4 | FP16 | 12.4 ms | — | *carried over from M1, not re-measured* |
 
 Reading the table:
 
@@ -83,7 +89,7 @@ Reading the table:
 - **ONNX Runtime INT8 is *slower* than its FP32 build** (30.8 ms vs 24.1 ms) — consistently, across every measurement run. Only the convolutions are quantized, because the Detect tail has to stay in FP32 (see below), so the graph pays for a `QuantizeLinear`/`DequantizeLinear` pair around all 64 convs without ever fusing into a fully-integer subgraph. INT8 is not automatically faster; it depends on whether the runtime's kernels can actually consume the quantized graph.
 - **The custom engine is ~250× slower than OpenVINO.** It is six nested loops with no vectorization, no blocking, no threading, and an FP32 requantization per output element. Closing that gap is what M4 is for. It is worth noting it is only ~12% slower than the *original, incorrect* engine (3145 ms) despite now also folding BatchNorm, correcting zero-points, and running a full Detect head with DFL decoding and NMS.
 - The two custom-engine rows differ by ~3%, confirming that per-channel weights cost essentially nothing at inference time — the requantization multiplier was already per-channel.
-- TensorRT needs an NVIDIA GPU and could not run on this machine. `benchmarks/tensorrt_int8_colab.py` reproduces the exact harness on a Colab T4. The FP16 figure is carried over from the original M1 run; being a different hardware class, it is not comparable to the CPU rows above.
+- **TensorRT INT8 is the fastest thing here at 4.4 ms — and the least accurate, at mAP 0.0833.** A default `int8=True` export destroys this model. Details below; it is the same failure that gave ONNX Runtime mAP 0.0000.
 
 ### Layer-by-layer accuracy
 
@@ -143,9 +149,24 @@ The reason is the same BatchNorm gain spread that caused defect 1. Filters withi
 
 ### Why the Detect head stays in FP32
 
-The first ONNX Runtime INT8 attempt scored **mAP 0.0000** while producing perfectly reasonable-looking box coordinates. The cause: the exported graph's final `Concat` merges box coordinates (0–640) with class scores (0–1) into one tensor. A single INT8 scale across that range is ~2.5 per step, so every class score rounds to zero.
+This turned out to be the most interesting result in the project, because **two independent production toolchains both destroy this model when asked to quantize it with default settings** — and for the same structural reason as defect **4** above.
 
-This is the same defect as **4** above, in a production toolchain. Restricting quantization to convolutions fixed it (0.0000 → 0.8556). The custom engine keeps the whole Detect head — DFL softmax, distance-to-box decoding, NMS — in FP32 for the same reason, which is also why it out-scores both production INT8 pipelines on accuracy.
+**ONNX Runtime** scored **mAP 0.0000** on the first attempt while producing perfectly reasonable-looking box coordinates. The exported graph's final `Concat` merges box coordinates (0–640) with class scores (0–1) into one tensor. A single INT8 scale across that range is ~2.5 per step, so every class score rounds to zero. Restricting quantization to convolutions fixed it: **0.0000 → 0.8556**.
+
+**TensorRT** does the same thing and cannot be talked out of it as easily. Ultralytics' `int8=True` export hands the graph to ModelOpt, which quantizes `Add`, `Mul`, `Conv`, `Resize` and `MaxPool` — 200 nodes in all. That sweeps in the arithmetic of the Detect tail itself: the DFL expectation and the `anchor ± distance` box decoding are `Add`/`Mul` ops operating on values spanning 0–640. The engine builds fine, runs fast, and is useless:
+
+| | fire AP@0.5 | smoke AP@0.5 | mAP@0.5 |
+|---|---|---|---|
+| PyTorch FP32 on the same T4 | 0.7742 | 0.9976 | **0.8859** |
+| TensorRT INT8 on the same T4 | 0.0000 | 0.1667 | **0.0833** |
+
+That FP32 row is a control, run through the *identical* preprocessing, NMS and scoring code on the same machine, and it reproduces the laptop CPU result exactly (0.7742 / 0.9976). So the collapse is real, not a harness artifact — a 4.4 ms inference that finds essentially nothing.
+
+The custom engine keeps the whole Detect head — DFL softmax, distance-to-box decoding, NMS — in FP32 by construction, which is precisely why it out-scores every production INT8 pipeline measured here. Quantizing a detector is not one decision applied uniformly to a graph; the box-decode arithmetic has a dynamic range that INT8 cannot hold, and a pipeline that does not know where the network stops being convolutions will quantize straight through it.
+
+### A note on the dataset labels
+
+Worth recording because it cost a debugging cycle: the upstream fire-8 dataset ships **3-class** labels (0=Fire, 1=default, 2=smoke), but this model is trained on the 2-class scheme produced by `datasets/fire-8/remap.py` (0 stays fire, 1 is dropped, 2 becomes smoke). Scoring against un-remapped labels yields mAP 0.0000 with no smoke ground truth at all — which looks exactly like a quantization failure and is not one. `benchmarks/setup_colab.py` applies the remap so a fresh clone reproduces the local labels byte-for-byte (31 fire + 20 smoke across the 49 test images).
 
 ## Benchmark methodology
 

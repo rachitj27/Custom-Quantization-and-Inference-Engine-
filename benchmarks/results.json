@@ -82,5 +82,29 @@
       "smoke": 0.9426
     },
     "note": "original weight-quantization scheme, kept for comparison"
+  },
+  {
+    "label": "PyTorch (Ultralytics), T4 FP32",
+    "min_ms": 8.0,
+    "median_ms": 8.1,
+    "mean_ms": 8.1,
+    "map50": 0.8859,
+    "per_class": {
+      "fire": 0.7742,
+      "smoke": 0.9976
+    },
+    "note": "Colab Tesla T4; control run proving the harness reproduces the CPU FP32 result"
+  },
+  {
+    "label": "TensorRT, T4 INT8",
+    "min_ms": 4.4,
+    "median_ms": 5.1,
+    "mean_ms": 5.1,
+    "map50": 0.0833,
+    "per_class": {
+      "fire": 0.0,
+      "smoke": 0.1667
+    },
+    "note": "Colab Tesla T4; default Ultralytics int8=True export quantizes the Detect decode tail and collapses accuracy"
   }
 ]
