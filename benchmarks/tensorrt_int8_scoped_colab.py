@@ -241,7 +241,18 @@ def build_engine(onnx_path, engine_path, workspace_gb=4):
             raise SystemExit("Failed to parse the quantized ONNX")
 
     config = builder.create_builder_config()
-    config.set_flag(trt.BuilderFlag.INT8)
+
+    # TensorRT 11 removed BuilderFlag.INT8. It is only needed for implicit
+    # quantization, where TensorRT decides precision itself. This ONNX is
+    # explicitly quantized, meaning the QuantizeLinear and DequantizeLinear
+    # nodes are already baked in, so TensorRT reads the precision off the graph.
+    if hasattr(trt.BuilderFlag, "INT8"):
+        config.set_flag(trt.BuilderFlag.INT8)
+    else:
+        print("BuilderFlag.INT8 absent, taking precision from the QDQ nodes")
+        print("  available flags: " +
+              ", ".join(n for n in dir(trt.BuilderFlag) if not n.startswith("_")))
+
     try:
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE,
                                      workspace_gb * (1 << 30))
