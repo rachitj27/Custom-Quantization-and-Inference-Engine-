@@ -122,6 +122,12 @@ def main(argv=None):
     ap.add_argument("--labels", default="fire-8/test/labels")
     ap.add_argument("--rounds", type=int, default=4)
     ap.add_argument("--timed-images", type=int, default=12)
+    ap.add_argument("--engine", default=None,
+                    help="benchmark an already-built .engine instead of exporting "
+                         "one. The INT8 export takes ~6 minutes, and Ultralytics' "
+                         "dependency auto-update can upgrade torch mid-run and break "
+                         "torchvision, forcing a runtime restart -- this lets the "
+                         "rebuilt session reuse the engine it already produced.")
 
     # Pasting this into a Colab cell means sys.argv carries the kernel's own
     # "-f .../kernel-xxxx.json", which argparse would reject. Ignore unknown
@@ -136,18 +142,22 @@ def main(argv=None):
         raise SystemExit("No CUDA device -- switch the Colab runtime to a T4 GPU.")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    # Ultralytics drives TensorRT's INT8 calibrator for us, using images from
-    # `data` -- the same fire-8 training split the other INT8 configs calibrate on.
-    print("Exporting INT8 TensorRT engine (takes several minutes)...")
-    export_kwargs = dict(format="engine", int8=True, data=args.data,
-                         imgsz=NET, batch=1, workspace=4)
-    try:
-        engine_path = YOLO(args.weights).export(**export_kwargs)
-    except TypeError:
-        # Older/newer Ultralytics releases disagree on `workspace`.
-        export_kwargs.pop("workspace", None)
-        engine_path = YOLO(args.weights).export(**export_kwargs)
-    print(f"Engine: {engine_path}")
+    if args.engine:
+        engine_path = args.engine
+        print(f"Reusing prebuilt engine: {engine_path}")
+    else:
+        # Ultralytics drives TensorRT's INT8 calibrator for us, using images from
+        # `data` -- the same fire-8 split the other INT8 configs calibrate on.
+        print("Exporting INT8 TensorRT engine (takes several minutes)...")
+        export_kwargs = dict(format="engine", int8=True, data=args.data,
+                             imgsz=NET, batch=1, workspace=4)
+        try:
+            engine_path = YOLO(args.weights).export(**export_kwargs)
+        except TypeError:
+            # Older/newer Ultralytics releases disagree on `workspace`.
+            export_kwargs.pop("workspace", None)
+            engine_path = YOLO(args.weights).export(**export_kwargs)
+        print(f"Engine: {engine_path}")
 
     model = YOLO(engine_path, task="detect")
 
