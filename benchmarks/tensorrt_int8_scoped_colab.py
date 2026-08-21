@@ -223,8 +223,15 @@ def build_engine(onnx_path, engine_path, workspace_gb=4):
     import tensorrt as trt
     logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
-    network = builder.create_network(
-        1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+
+    # TensorRT 10 and later dropped EXPLICIT_BATCH, since every network is
+    # explicit batch now. Older versions still require the flag.
+    try:
+        network = builder.create_network(
+            1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    except AttributeError:
+        network = builder.create_network()
+
     parser = trt.OnnxParser(network, logger)
 
     with open(onnx_path, "rb") as f:
