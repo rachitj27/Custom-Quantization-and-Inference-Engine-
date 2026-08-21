@@ -63,26 +63,27 @@ The hand-written engine is the **most accurate INT8 configuration measured here*
 
 ### Latency
 
-Intel Core Ultra 7 256V, laptop **on battery** (Balanced power scheme). Each runtime measured in its own process with a settle gap between runs, 4 rounds × 12 images, reporting the fastest observed time. See *Benchmark methodology* below — this took three attempts to get right.
+Intel Core Ultra 7 256V, **on AC power**. Each runtime measured in its own process with a 10 s settle gap between runs, 10 rounds × 12 images (120 samples each), reporting the fastest observed time. See *Benchmark methodology* below — this took several attempts to get right.
 
 | Runtime | Precision | Best latency | Median | mAP@0.5 |
 |---------|-----------|--------------|--------|---------|
-| PyTorch (Ultralytics) | FP32 | 71.4 ms | 76.8 ms | 0.8859 |
-| ONNX Runtime | FP32 | 36.4 ms | 44.1 ms | 0.8859 |
-| ONNX Runtime | INT8 | 38.5 ms | 51.1 ms | 0.8556 |
-| OpenVINO | FP32 | 30.4 ms | 31.7 ms | 0.8859 |
-| **OpenVINO** | **INT8** | **16.0 ms** | 18.4 ms | 0.8089 |
-| Custom C++ engine (per-channel) | INT8 | 5055.8 ms | 5257.9 ms | 0.8826 |
-| Custom C++ engine (per-tensor) | INT8 | 5182.1 ms | 5407.5 ms | 0.7680 |
-| TensorRT (NVIDIA T4, Colab) | FP16 | 12.4 ms | — | *not re-measured* |
+| PyTorch (Ultralytics) | FP32 | 42.4 ms | 58.5 ms | 0.8859 |
+| ONNX Runtime | FP32 | 24.1 ms | 28.4 ms | 0.8859 |
+| ONNX Runtime | INT8 | 30.8 ms | 35.8 ms | 0.8556 |
+| OpenVINO | FP32 | 28.5 ms | 33.3 ms | 0.8859 |
+| **OpenVINO** | **INT8** | **13.9 ms** | 16.4 ms | 0.8089 |
+| Custom C++ engine (per-channel) | INT8 | 3516.4 ms | 3537.1 ms | 0.8826 |
+| Custom C++ engine (per-tensor) | INT8 | 3418.1 ms | 3461.4 ms | 0.7680 |
+| TensorRT (NVIDIA T4, Colab) | FP16 | 12.4 ms | — | *carried over from M1* |
 | TensorRT (NVIDIA T4, Colab) | INT8 | *not measured* | — | — |
 
 Reading the table:
 
-- **OpenVINO INT8 is the clear winner at 16.0 ms**, a 1.9× speedup over its own FP32 build. This is what INT8 is supposed to buy you.
-- **ONNX Runtime INT8 is marginally *slower* than its FP32 build** (38.5 ms vs 36.4 ms). Only the convolutions are quantized — the Detect tail has to stay in FP32 (see below) — so the graph pays for a `QuantizeLinear`/`DequantizeLinear` pair around all 64 convs without ever fusing into a fully-integer subgraph. INT8 is not automatically faster; it depends on whether the runtime's kernels can actually consume the quantized graph.
-- **The custom engine is ~300× slower than OpenVINO.** It is six nested loops with no vectorization, no blocking, no threading, and an FP32 requantization per output element. Closing that gap is what M4 is for.
-- TensorRT needs an NVIDIA GPU and could not run on this machine. `benchmarks/tensorrt_int8_colab.py` reproduces the exact harness on a Colab T4; the FP16 figure is carried over from the original M1 run and was not re-measured in this session.
+- **OpenVINO INT8 is the clear winner at 13.9 ms**, a 2.05× speedup over its own FP32 build. This is what INT8 is supposed to buy you.
+- **ONNX Runtime INT8 is *slower* than its FP32 build** (30.8 ms vs 24.1 ms) — consistently, across every measurement run. Only the convolutions are quantized, because the Detect tail has to stay in FP32 (see below), so the graph pays for a `QuantizeLinear`/`DequantizeLinear` pair around all 64 convs without ever fusing into a fully-integer subgraph. INT8 is not automatically faster; it depends on whether the runtime's kernels can actually consume the quantized graph.
+- **The custom engine is ~250× slower than OpenVINO.** It is six nested loops with no vectorization, no blocking, no threading, and an FP32 requantization per output element. Closing that gap is what M4 is for. It is worth noting it is only ~12% slower than the *original, incorrect* engine (3145 ms) despite now also folding BatchNorm, correcting zero-points, and running a full Detect head with DFL decoding and NMS.
+- The two custom-engine rows differ by ~3%, confirming that per-channel weights cost essentially nothing at inference time — the requantization multiplier was already per-channel.
+- TensorRT needs an NVIDIA GPU and could not run on this machine. `benchmarks/tensorrt_int8_colab.py` reproduces the exact harness on a Colab T4. The FP16 figure is carried over from the original M1 run; being a different hardware class, it is not comparable to the CPU rows above.
 
 ### Layer-by-layer accuracy
 
@@ -148,13 +149,14 @@ This is the same defect as **4** above, in a production toolchain. Restricting q
 
 ## Benchmark methodology
 
-The latency numbers took three corrections to get right, which is worth recording because the wrong versions looked plausible:
+The latency numbers took four corrections to get right, which is worth recording because the wrong versions all looked plausible:
 
 1. **One process per runtime.** PyTorch, ONNX Runtime and OpenVINO each build a thread pool sized to the core count. Loaded into one process they oversubscribe the CPU — ONNX FP32 measured **360 ms** sharing a process, versus **34 ms** alone.
 2. **A settle gap between runtimes.** Even in separate processes, launching back to back leaves the previous runtime's threads winding down. ONNX FP32 measured **341 ms** immediately after a PyTorch run, versus **34 ms** after an 8-second pause.
 3. **Report the minimum.** Interference can only make a run slower, so the fastest observed time is the best estimate of real cost. An early run reported a *mean* of 272 ms against a *median* of 413 ms — a distribution that shape only happens when something else is stealing the CPU.
+4. **Enough samples, on AC power.** On battery the CPU throttles and run-to-run variance was large enough to reorder the table: one pass had OpenVINO FP32 at 30.4 ms and the next at 34.8 ms, flipping it either side of ONNX FP32. The final numbers are 120 samples per runtime on mains power, where the spread closes to a few percent.
 
-The result validates itself: OpenVINO FP32 now measures **30.4 ms** against the **30.57 ms** recorded in the original M1 run on the same machine.
+The result validates itself against the original M1 run on the same machine: PyTorch FP32 measures **42.4 ms** against **45.77 ms**, and OpenVINO FP32 **28.5 ms** against **30.57 ms**. (ONNX FP32 comes out faster than the original 40.10 ms, most likely a newer `onnxruntime` build.)
 
 ## Approach
 

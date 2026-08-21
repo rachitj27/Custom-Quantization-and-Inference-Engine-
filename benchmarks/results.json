@@ -1,81 +1,81 @@
 [
   {
     "label": "PyTorch (Ultralytics) FP32",
-    "min_ms": 71.42799999928684,
-    "median_ms": 76.81100000081642,
-    "mean_ms": 77.19264999999116,
+    "min_ms": 42.407500000990694,
+    "median_ms": 58.505150000200956,
+    "mean_ms": 58.340239166712614,
     "map50": 0.8859062980030722,
     "per_class": {
       "fire": 0.7741935483870968,
       "smoke": 0.9976190476190476
     },
-    "n_samples": 48
+    "n_samples": 120
   },
   {
     "label": "ONNX Runtime FP32",
-    "min_ms": 36.42210000180057,
-    "median_ms": 44.11824999806413,
-    "mean_ms": 44.4477083331852,
+    "min_ms": 24.06390000032843,
+    "median_ms": 28.44455000013113,
+    "mean_ms": 28.957130833623523,
     "map50": 0.8859062980030722,
     "per_class": {
       "fire": 0.7741935483870968,
       "smoke": 0.9976190476190476
     },
-    "n_samples": 48
+    "n_samples": 120
   },
   {
     "label": "ONNX Runtime INT8",
-    "min_ms": 38.50370000145631,
-    "median_ms": 51.054699999440345,
-    "mean_ms": 51.70562499984044,
+    "min_ms": 30.753399998502573,
+    "median_ms": 35.80080000028829,
+    "mean_ms": 36.403524999968795,
     "map50": 0.8555754413202232,
     "per_class": {
       "fire": 0.7352150537634409,
       "smoke": 0.9759358288770055
     },
-    "n_samples": 48
+    "n_samples": 120
   },
   {
     "label": "OpenVINO FP32",
-    "min_ms": 30.353099999047117,
-    "median_ms": 31.676349999543163,
-    "mean_ms": 31.940397916590275,
+    "min_ms": 28.519399998913286,
+    "median_ms": 33.256899998377776,
+    "mean_ms": 34.17656749995027,
     "map50": 0.8859062980030722,
     "per_class": {
       "fire": 0.7741935483870968,
       "smoke": 0.9976190476190476
     },
-    "n_samples": 48
+    "n_samples": 120
   },
   {
     "label": "OpenVINO INT8",
-    "min_ms": 15.999700000975281,
-    "median_ms": 18.417249999401974,
-    "mean_ms": 18.849970833268042,
+    "min_ms": 13.889900001231581,
+    "median_ms": 16.41974999984086,
+    "mean_ms": 17.091280000052695,
     "map50": 0.8088771443610153,
     "per_class": {
       "fire": 0.7126260835938255,
       "smoke": 0.9051282051282051
     },
-    "n_samples": 48
+    "n_samples": 120
   },
   {
     "label": "Custom C++ engine (per-channel) INT8",
-    "min_ms": 5055.8,
-    "median_ms": 5257.9,
-    "mean_ms": 5257.9,
+    "min_ms": 3516.4,
+    "median_ms": 3537.1,
+    "mean_ms": 3537.1,
     "map50": 0.8826,
     "per_class": {
       "fire": 0.7742,
       "smoke": 0.9909
     },
-    "note": "measured via cpp_engine/build/custom_engine --bench 4; mAP via quantization/eval_map.py over the full test set"
+    "note": "cpp_engine/build/custom_engine --bench 6 on AC power; mAP via quantization/eval_map.py over the full test set"
   },
   {
     "label": "Custom C++ engine (per-tensor) INT8",
-    "min_ms": 5182.1,
-    "median_ms": 5407.5,
-    "mean_ms": 5407.5,
+    "min_ms": 3418.1,
+    "median_ms": 3461.4,
+    "mean_ms": 3461.4,
     "map50": 0.768,
     "per_class": {
       "fire": 0.5935,
