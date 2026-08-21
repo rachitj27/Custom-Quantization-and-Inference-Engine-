@@ -1,15 +1,23 @@
 # Custom AI Hardware Inference
 
-A from-scratch inference and quantization pipeline for a YOLOv8n fire and smoke detection model. Instead of treating quantization and inference as black-box library calls, this project implements the underlying math from scratch, then benchmarks the result against production runtimes.
+A fire and smoke detector that runs on hand written C++ instead of a machine learning library.
 
-The engine takes a JPEG and draws boxes around fire and smoke, running the entire quantized forward pass — convolutions, activations, the Detect head, DFL box decoding and NMS — in hand-written C++.
+The starting point is a YOLOv8n model trained to find fire and smoke in photos. Normally you would run that model with a library like PyTorch or ONNX Runtime, which does all the math for you. This project rebuilds that math from scratch, first shrinking the model so it uses 8 bit whole numbers instead of 32 bit decimals, then writing the code that actually runs it.
+
+Give it a photo and it draws boxes around the fire and smoke it finds.
 
 ## Status
 
-- [x] **M1: FP32 baseline** — trained YOLOv8n on the fire-8 dataset, benchmarked across four production runtimes
-- [x] **M2: From-scratch INT8 quantization** — affine quantization, quantized matmul, and activation calibration implemented end to end
-- [x] **M3: Custom C++ inference engine** — loads the quantized model, runs full INT8 inference, decodes boxes, and retains **99.6% of FP32 mAP@0.5**
-- [ ] **M4: Hardware accelerator** — Verilog RTL FPGA accelerator (stretch goal)
+- [x] **M1, FP32 baseline.** Trained YOLOv8n on the fire-8 dataset and benchmarked it across four production libraries.
+- [x] **M2, INT8 quantization from scratch.** Wrote the math that converts the model from decimals to 8 bit whole numbers.
+- [x] **M3, custom C++ engine.** Loads the shrunken model, runs it end to end, decodes the boxes, and keeps **99.6% of the original accuracy**.
+- [ ] **M4, hardware accelerator.** An FPGA version written in Verilog. Stretch goal.
+
+## What quantization means here
+
+A trained neural network stores its numbers as 32 bit decimals. Quantization replaces each one with an 8 bit whole number, which can only hold 256 distinct values. You store a scale factor alongside it so the original value can be approximated as `scale x (stored_value - offset)`.
+
+The payoff is a model that is four times smaller and, on hardware built for it, several times faster. The cost is precision, since you are rounding every number onto a grid of 256 steps. Most of the time that rounding is harmless. Figuring out where it is *not* harmless turned out to be the most interesting part of this project, and there is a section on it below.
 
 ## Usage
 
@@ -23,235 +31,222 @@ cmake .. && make
                          --model-bin  ../../quantization/model_int8_pc.bin
 ```
 
-It prints each detection and writes an annotated copy of the image:
+It prints what it found and saves a copy of the image with boxes drawn on it.
 
 ```
 Loaded fire.jpg (640x640)
-Inference: 5155.8 ms
+Inference: 3516.4 ms
 Detections: 1
   fire   0.830  box=[329.2, 158.6, 532.6, 585.8]
-Wrote fire_pred.jpg
 ```
 
-Requires `cmake`, a C++17 compiler, and `nlohmann-json`. JPEG/PNG decoding uses [stb](https://github.com/nothings/stb), vendored in `cpp_engine/third_party/`.
+You need `cmake`, a C++17 compiler, and `nlohmann-json`. Reading and writing JPEGs uses [stb](https://github.com/nothings/stb), which is included in `cpp_engine/third_party/`.
 
-## Model
+## The model
 
-YOLOv8n fine-tuned on the fire-8 dataset (2 classes: fire, smoke). Trained for 50 epochs on a Tesla T4 in Google Colab.
+YOLOv8n fine tuned on the fire-8 dataset, which has two classes, fire and smoke. Trained for 50 epochs on a Tesla T4 in Google Colab.
 
-- Parameters: 3.0M
-- Model size (FP32): 6.0 MB
-- Model size (INT8): 2.9 MB (~4× compression)
+- 3.0M parameters
+- 6.0 MB as 32 bit decimals
+- 2.9 MB as 8 bit whole numbers, so about four times smaller
 
 ## Results
 
 ### Accuracy
 
-Every number below was produced by `quantization/eval_map.py` over the 49-image test set, using identical preprocessing (plain 640×640 resize) and a single VOC all-point-interpolation AP implementation, so the rows are directly comparable to each other.
+The score below is mAP@0.5, a standard detection metric. Roughly speaking it asks how often the model draws a box in the right place with the right label, where a box counts as correct if it overlaps the true box by at least half. Higher is better and 1.0 is perfect.
 
-| Configuration | fire AP@0.5 | smoke AP@0.5 | mAP@0.5 | vs FP32 |
+Every number here comes from the same scoring script (`quantization/eval_map.py`) run over the same 49 test images with the same image preparation, so the rows can be compared directly.
+
+| Configuration | fire | smoke | mAP@0.5 | vs FP32 |
 |---|---|---|---|---|
-| FP32 (PyTorch / ONNX / OpenVINO — all identical) | 0.7742 | 0.9976 | **0.8859** | — |
-| **Custom C++ engine, per-channel weights** | 0.7742 | 0.9909 | **0.8826** | **99.6%** |
+| Original 32 bit model (PyTorch, ONNX and OpenVINO all agree) | 0.7742 | 0.9976 | **0.8859** | reference |
+| **This engine, per channel weights** | 0.7742 | 0.9909 | **0.8826** | **99.6%** |
 | ONNX Runtime INT8 | 0.7352 | 0.9759 | 0.8556 | 96.6% |
-| OpenVINO INT8 (NNCF) | 0.7126 | 0.9051 | 0.8089 | 91.3% |
-| Custom C++ engine, per-tensor weights | 0.5935 | 0.9426 | 0.7680 | 86.7% |
+| OpenVINO INT8 | 0.7126 | 0.9051 | 0.8089 | 91.3% |
+| This engine, per tensor weights | 0.5935 | 0.9426 | 0.7680 | 86.7% |
 
-The hand-written engine is the **most accurate INT8 configuration measured here** — ahead of both production INT8 pipelines. That is not because the arithmetic is cleverer; it is because the engine keeps the Detect head's box decoding in FP32 and calibrates every convolution individually, where the automated pipelines apply a single policy across the whole graph.
+The hand written engine is the **most accurate 8 bit version measured here**, ahead of both production libraries. Not because the arithmetic is cleverer, but because of one design choice explained in the section on the detection head further down.
 
-> **Note on the 0.9253 figure in earlier versions of this README:** that came from Ultralytics' `model.val()`, which letterboxes inputs and uses its own AP implementation. This table uses a self-contained evaluator so the custom engine can be scored the same way as everything else. The two protocols are not interchangeable — the FP32 model is unchanged.
+> An earlier version of this README quoted 0.9253. That figure came from Ultralytics' own scoring tool, which prepares images differently and counts matches slightly differently. This table uses one self contained scorer so the custom engine can be measured the same way as everything else. The model itself has not changed.
 
-### Latency
+### Speed
 
-Intel Core Ultra 7 256V, **on AC power**. Each runtime measured in its own process with a 10 s settle gap between runs, 10 rounds × 12 images (120 samples each), reporting the fastest observed time. See *Benchmark methodology* below — this took several attempts to get right.
+Measured on an Intel Core Ultra 7 256V laptop running on mains power. Each library was timed in its own process with a pause in between, 10 rounds of 12 images each, reporting the fastest time seen. The section on benchmark methodology explains why all of that matters.
 
-| Runtime | Precision | Best latency | Median | mAP@0.5 |
-|---------|-----------|--------------|--------|---------|
+| Runtime | Precision | Best | Median | mAP@0.5 |
+|---------|-----------|------|--------|---------|
 | PyTorch (Ultralytics) | FP32 | 42.4 ms | 58.5 ms | 0.8859 |
 | ONNX Runtime | FP32 | 24.1 ms | 28.4 ms | 0.8859 |
 | ONNX Runtime | INT8 | 30.8 ms | 35.8 ms | 0.8556 |
 | OpenVINO | FP32 | 28.5 ms | 33.3 ms | 0.8859 |
 | **OpenVINO** | **INT8** | **13.9 ms** | 16.4 ms | 0.8089 |
-| Custom C++ engine (per-channel) | INT8 | 3516.4 ms | 3537.1 ms | 0.8826 |
-| Custom C++ engine (per-tensor) | INT8 | 3418.1 ms | 3461.4 ms | 0.7680 |
+| This engine, per channel | INT8 | 3516.4 ms | 3537.1 ms | 0.8826 |
+| This engine, per tensor | INT8 | 3418.1 ms | 3461.4 ms | 0.7680 |
 
-GPU numbers are kept separate because a Tesla T4 is not comparable to a laptop CPU. Measured on Colab with the same preprocessing, NMS and mAP code:
+GPU results are listed separately because a data centre GPU and a laptop CPU are not comparable. These ran on a Tesla T4 in Colab using the same image preparation and scoring code.
 
-| Runtime | Precision | Best latency | Median | mAP@0.5 |
-|---------|-----------|--------------|--------|---------|
+| Runtime | Precision | Best | Median | mAP@0.5 |
+|---------|-----------|------|--------|---------|
 | PyTorch (Ultralytics), T4 | FP32 | 8.0 ms | 8.1 ms | 0.8859 |
 | **TensorRT, T4** | **INT8** | **4.4 ms** | 5.1 ms | **0.0833** |
-| TensorRT, T4 | FP16 | 12.4 ms | — | *carried over from M1, not re-measured* |
+| TensorRT, T4 | FP16 | 12.4 ms | not re-measured | carried over from M1 |
 
-Reading the table:
+What the numbers say.
 
-- **OpenVINO INT8 is the clear winner at 13.9 ms**, a 2.05× speedup over its own FP32 build. This is what INT8 is supposed to buy you.
-- **ONNX Runtime INT8 is *slower* than its FP32 build** (30.8 ms vs 24.1 ms) — consistently, across every measurement run. Only the convolutions are quantized, because the Detect tail has to stay in FP32 (see below), so the graph pays for a `QuantizeLinear`/`DequantizeLinear` pair around all 64 convs without ever fusing into a fully-integer subgraph. INT8 is not automatically faster; it depends on whether the runtime's kernels can actually consume the quantized graph.
-- **The custom engine is ~250× slower than OpenVINO.** It is six nested loops with no vectorization, no blocking, no threading, and an FP32 requantization per output element. Closing that gap is what M4 is for. It is worth noting it is only ~12% slower than the *original, incorrect* engine (3145 ms) despite now also folding BatchNorm, correcting zero-points, and running a full Detect head with DFL decoding and NMS.
-- The two custom-engine rows differ by ~3%, confirming that per-channel weights cost essentially nothing at inference time — the requantization multiplier was already per-channel.
-- **TensorRT INT8 is the fastest thing here at 4.4 ms — and the least accurate, at mAP 0.0833.** A default `int8=True` export destroys this model. Details below; it is the same failure that gave ONNX Runtime mAP 0.0000.
+- **OpenVINO INT8 wins on CPU at 13.9 ms**, just over twice as fast as the same library running the full precision model. This is what 8 bit is supposed to buy you.
+- **ONNX Runtime INT8 is slightly slower than its own full precision build**, 30.8 ms against 24.1 ms, and that held across every measurement run. Only the convolutions could be quantized safely, so the graph pays the cost of converting numbers back and forth around all 64 of them without ever getting to run one long stretch of pure integer math. Going to 8 bit does not automatically make things faster. It depends on whether the library can actually use the result.
+- **This engine is roughly 250 times slower than OpenVINO.** It is six nested loops with no vectorization, no threading, and no memory tricks. Speeding it up is what M4 is for. Worth noting though that it is only about 12% slower than the earlier, broken version of itself, despite now doing considerably more work.
+- The two rows for this engine differ by about 3%, which confirms that per channel weights are effectively free at runtime.
+- **TensorRT INT8 is the fastest result anywhere in this project at 4.4 ms, and also by far the least accurate at 0.0833.** A default export destroys this model. That story is below.
 
-### Layer-by-layer accuracy
+## Fixing the accuracy
 
-Each of the 22 backbone layers' INT8 output compared against the FP32 model quantized on the same grid, on one test image (`quantization/compare_layers.py`, per-channel weights):
+An earlier version of this engine drifted badly, and the drift compounded the deeper you went. At the first layer, 38.3% of its numbers were within one step of the reference. By the last layer only 1.1% were. The README at the time blamed one particular cause. That cause was real but it was not the main one.
 
-| Layer | Type | within ±1 | MAE | | Layer | Type | within ±1 | MAE |
-|---|---|---|---|---|---|---|---|---|
-| L00 | Conv | 99.91% | 0.081 | | L09 | SPPF | 68.65% | 1.683 |
-| L01 | Conv | 99.91% | 0.119 | | L15 | C2f | 99.40% | 0.241 |
-| L02 | C2f | 77.46% | 0.954 | | L18 | C2f | 94.92% | 0.393 |
-| L06 | C2f | 90.71% | 0.535 | | L21 | C2f | 94.94% | 0.410 |
-
-The key property is that **error no longer compounds with depth** — L21 (94.94%) is more accurate than L02 (77.46%). Residual error is ordinary INT8 rounding noise, not a systematic defect.
-
-## What made it accurate
-
-An earlier version of this engine drifted badly, and the drift grew with depth — layer 0 matched the reference on 38.3% of values, layer 21 on 1.1%, with a mean absolute error of 132 INT8 steps. The README at the time blamed concat scale mixing. That was a real bug, but it was not the main one.
-
-| Layer | within ±1 (before → after) | MAE (before → after) |
+| Layer | Within one step, before and after | Average error, before and after |
 |---|---|---|
-| L00 | 38.3% → **99.91%** | 9.0 → **0.081** |
-| L02 | 10.2% → **77.46%** | 80.2 → **0.954** |
-| L15 | 17.6% → **99.40%** | 15.3 → **0.241** |
-| L18 | 2.8% → **94.92%** | 83.8 → **0.393** |
-| L21 | 1.1% → **94.94%** | 132.4 → **0.410** |
+| L00 | 38.3% to **99.91%** | 9.0 to **0.081** |
+| L02 | 10.2% to **77.46%** | 80.2 to **0.954** |
+| L15 | 17.6% to **99.40%** | 15.3 to **0.241** |
+| L18 | 2.8% to **94.92%** | 83.8 to **0.393** |
+| L21 | 1.1% to **94.94%** | 132.4 to **0.410** |
 
-Five defects, in the order they mattered:
+There were five separate bugs. In order of how much they mattered.
 
-**1. BatchNorm was never folded.** The exporter walked `named_modules()` and quantized each `Conv2d.weight` directly. But YOLOv8's `Conv` block is `Conv2d(bias=False) → BatchNorm2d → SiLU`, so the engine was silently omitting an entire operator. At layer 0 alone, BatchNorm applies a per-channel gain spanning **13.0× to 150.8×** plus a per-channel bias from −3.0 to +6.7. This was wrong from the very first layer.
+**1. An entire operation was missing.** YOLOv8 layers are built from three pieces stacked together, a convolution, then a normalization step called BatchNorm, then an activation function. The export script only saved the convolution. BatchNorm was silently dropped.
 
-It hid because the per-operator validation compared against `F.conv2d(input, weight)` — a bare convolution with no BatchNorm either. Both sides omitted the same operator, so the test passed at 84%.
+This is not a rounding error. BatchNorm multiplies each output channel by its own factor, and at the very first layer those factors range from 13x to 151x. The engine was skipping all of it.
 
-The fix folds BatchNorm into a per-output-channel gain and bias at export time:
+The bug hid because the test that was supposed to catch it compared the engine against a reference that *also* left BatchNorm out. Both sides were wrong in the same way, so the test passed at 84%.
 
-```
-gain[oc] = gamma[oc] / sqrt(var[oc] + eps)
-bias[oc] = beta[oc] - gamma[oc] * mean[oc] / sqrt(var[oc] + eps)
-```
+The fix folds BatchNorm into a per channel multiplier and offset that get applied while converting numbers back from integers, so it costs nothing extra at runtime.
 
-which the engine applies during requantization. The multiplier was already per-output-channel, so this costs nothing at inference time.
+**2. The offset was ignored during convolution.** Each 8 bit number represents a real value through a scale and an offset. The convolution code used the stored numbers directly without subtracting the offset first, which throws off every convolution in the network. Handling it properly also fixes image border handling for free, since a padded edge pixel represents a real zero and now correctly contributes nothing.
 
-**2. Convolution ignored the input zero-point.** Activations are asymmetric, so the accumulator must be `Σ(q_in − z_in)·q_w`, not `Σ q_in·q_w`. Every convolution in the network was affected. Subtracting the zero-point inside the accumulation also makes zero-padding exact for free: a padded position holds real 0, i.e. `q == z_in`, so it contributes nothing — where the old code skipped padded positions and silently treated them as `q = 0`.
+**3. Values were clipped before the activation function ran.** The engine squeezed each convolution's output into the range recorded for that layer, then applied the activation function. But that recorded range was measured *after* the activation, which never outputs anything below about -0.278. The raw convolution output goes far more negative than that, so the entire negative tail was cut off before the activation function ever saw it. Doing the convolution and the activation together, before rounding, removes the problem.
 
-**3. Activations were clipped before SiLU ran.** The engine requantized each convolution's output into the layer's calibrated range and *then* applied SiLU. But that range is calibrated on the **post**-SiLU tensor — layer 0's is `[−0.278, 56.08]` — while the pre-activation values run far more negative. The negative tail was clamped away before SiLU ever saw it. Fusing convolution and activation through the INT32 accumulator removes the intermediate rounding entirely.
+**4. Feature maps on different scales were glued together.** When the network merges two sets of features, each set arrives with its own scale factor. The old code copied the raw bytes together as if the scales matched. They now get converted to a common scale first.
 
-**4. Concat mixed scales.** Feature maps arriving on different scales were concatenated as raw INT8 bytes. Each input is now requantized to one common scale first — for the C2f blocks, a scale calibrated on the tensor that actually feeds `cv2`. (SPPF needs no requantization: max-pooling preserves its input's scale, so all four branches already agree.)
+**5. Skip connections dropped the offset.** Adding two 8 bit numbers is not as simple as adding the stored values, because the offset gets counted twice. The addition now happens on the real values and gets converted back once.
 
-**5. Residual connections dropped the zero-point.** `q_y + q_in` should be `q_y + q_in − z`. The skip connection is now added in the real domain and quantized once, so the two tensors' scales need not agree.
+Fixing the first three alone was enough to make layer 0 match the reference exactly.
 
-Fixing 1–3 alone brought layer 0 from 38.3% to a **bit-exact match** against the reference.
+### Per tensor against per channel weights
 
-### Per-tensor vs per-channel weights
+Both versions are built in, using `python quantization/save_model.py [--per-channel]`, and both are in the results table.
 
-Both schemes are implemented (`python quantization/save_model.py [--per-channel]`) and both are in the table above. Per-channel is worth it here: **0.7680 → 0.8826 mAP@0.5**, recovering nearly all the remaining gap to FP32, with fire AP going from 0.5935 to 0.7742 — exactly matching FP32.
+Per channel is clearly worth it here, taking the score from **0.7680 to 0.8826**. The fire class in particular goes from 0.5935 to 0.7742, which is exactly the full precision number.
 
-The reason is the same BatchNorm gain spread that caused defect 1. Filters within one layer differ in magnitude by more than an order of magnitude, and a single per-tensor scale forces the quietest filters into a handful of the 256 available levels. Per-channel costs 4 bytes per output channel of metadata and nothing at inference time, because the requantization multiplier is already per-channel.
+The reason connects back to bug 1. A single layer contains many filters, and their strengths can differ by more than a factor of ten. One shared scale for the whole layer forces the quietest filters into a handful of the 256 available steps, and their detail is lost. Giving each filter its own scale costs four extra bytes per filter and nothing at all at runtime.
 
-### Why the Detect head stays in FP32
+## Why the detection head stays in full precision
 
-This turned out to be the most interesting result in the project, because **two independent production toolchains both destroy this model when asked to quantize it with default settings** — and for the same structural reason as defect **4** above.
+This turned out to be the most interesting finding in the project, because **two separate professional toolchains both wreck this model when you ask them to quantize it with default settings**, and for the same underlying reason as bug 4 above.
 
-**ONNX Runtime** scored **mAP 0.0000** on the first attempt. Inspecting the raw output tensor showed exactly where the damage was:
+**ONNX Runtime** scored **0.0000** on the first attempt. Looking at the raw output showed exactly where the damage was.
 
-| | box rows (min/max) | class score rows (min/max) |
+| | box values, min and max | confidence scores, min and max |
 |---|---|---|
-| FP32 | 6.70 / 634.43 | 0.0 / 0.751 |
-| INT8 (everything quantized) | 7.60 / 635.58 | **0.0 / 0.0** |
+| Full precision | 6.70 to 634.43 | 0.0 to 0.751 |
+| 8 bit, everything quantized | 7.60 to 635.58 | **0.0 to 0.0** |
 
-The boxes were fine. **Every class score was exactly zero.** The exported graph's final `Concat` merges box coordinates (0–640) with class scores (0–1) into one tensor; a single INT8 scale across that range is ~2.5 per step, so every score — all of which are ≤ 1 — rounds to zero. Nothing clears the confidence threshold and the model detects nothing. Restricting quantization to convolutions fixed it: **0.0000 → 0.8556**.
+The boxes were fine. **Every confidence score was exactly zero.** At the very end the network glues the box coordinates and the confidence scores into a single block of numbers. Box coordinates run from 0 to 640. Confidence scores run from 0 to 1. Forced to cover both with one shared scale, each step is about 2.5, so every score, all of which are below 1, rounds down to zero. Nothing passes the confidence threshold and the model reports nothing at all. Quantizing only the convolutions fixed it, taking the score from **0.0000 to 0.8556**.
 
-It is worth being precise about what is *not* the problem, because the intuitive answer is wrong. Rounding box coordinates to that same ~2.5 px grid is survivable: perturbing every edge of every ground-truth box by 2.51 px leaves median IoU at 0.925 (fire) and 0.963 (smoke), with **0%** of boxes dropping below the 0.5 matching threshold. INT8 ruins detectors through the *scores and the distribution logits*, not through coarse box coordinates.
+It is worth being clear about what is *not* the problem here, because the obvious guess is wrong. Rounding the box coordinates onto that same coarse grid is survivable. Shifting every edge of every true box by 2.51 pixels still leaves an average overlap of 0.925 for fire and 0.963 for smoke, and **not a single box** falls below the 0.5 threshold that counts as a match. Eight bit precision ruins detectors through the confidence scores, not through blurry box coordinates.
 
-**TensorRT** fails the same way and cannot be talked out of it as easily. Ultralytics' `int8=True` export hands the graph to ModelOpt, which quantizes `Add`, `Mul`, `Conv`, `Resize` and `MaxPool` — 200 nodes in all — sweeping in the Detect tail's own arithmetic, including the DFL softmax over 16 distance bins per box edge. The engine builds fine, runs fast, and is useless:
+**TensorRT** fails the same way and is harder to talk out of it. The standard export path quantizes 200 operations including the arithmetic that turns raw network output into box coordinates. The result builds cleanly, runs faster than anything else measured here, and finds almost nothing.
 
-| | fire AP@0.5 | smoke AP@0.5 | mAP@0.5 |
+| | fire | smoke | mAP@0.5 |
 |---|---|---|---|
-| PyTorch FP32 on the same T4 | 0.7742 | 0.9976 | **0.8859** |
-| TensorRT INT8 on the same T4 | 0.0000 | 0.1667 | **0.0833** |
+| Full precision on the same T4 | 0.7742 | 0.9976 | **0.8859** |
+| TensorRT 8 bit on the same T4 | 0.0000 | 0.1667 | **0.0833** |
 
-That FP32 row is a control, run through the *identical* preprocessing, NMS and scoring code on the same machine, and it reproduces the laptop CPU result exactly (0.7742 / 0.9976). So the collapse is real, not a harness artifact — a 4.4 ms inference that finds essentially nothing.
+That first row is a control. It ran through the *same* image preparation and scoring code on the *same* machine, and it reproduces the laptop result exactly. So the collapse is real and not a measurement mistake.
 
-The exact mechanism inside TensorRT was not isolated the way it was for ONNX Runtime; ModelOpt reports "finding concat eliminated tensors", so it evidently does not crush the scores as bluntly, which fits 0.0833 rather than a clean 0.0000. The pattern of failure is suggestive though: fire scores 0.0000 while smoke — whose boxes cover a median 70% of the frame against fire's 16% — still scrapes 0.1667. That is what class confusion looks like, where a wrongly-labelled box is large enough to overlap something. Confirming it would mean driving ModelOpt directly rather than through Ultralytics.
+The precise mechanism inside TensorRT was not pinned down the way it was for ONNX Runtime, and its toolchain handles that final merge differently, which fits a score of 0.0833 rather than a clean zero. The shape of the failure is suggestive though. Fire scores nothing while smoke still manages 0.1667, and smoke boxes cover about 70% of the image on average against fire's 16%. That is what it looks like when labels get swapped and a mislabelled box is simply big enough to overlap something by accident. Confirming that would mean using the quantization toolkit directly instead of through Ultralytics.
 
-The custom engine keeps the whole Detect head — DFL softmax, distance-to-box decoding, NMS — in FP32 by construction, which is precisely why it out-scores every production INT8 pipeline measured here. Quantizing a detector is not one decision applied uniformly to a graph; the box-decode arithmetic has a dynamic range that INT8 cannot hold, and a pipeline that does not know where the network stops being convolutions will quantize straight through it.
+None of this means TensorRT is bad. It means the default settings are wrong for this kind of model. This engine keeps the entire detection head in full precision by design, which is exactly why it scores higher than every professional 8 bit pipeline measured here. Quantizing a detector is not one decision applied evenly across a network. The final box decoding step needs a range of values that 8 bits cannot hold, and a tool that does not know where the convolutions stop will quantize straight through it.
 
-### A note on the dataset labels
+## A trap in the dataset labels
 
-Worth recording because it cost a debugging cycle: the upstream fire-8 dataset ships **3-class** labels (0=Fire, 1=default, 2=smoke), but this model is trained on the 2-class scheme produced by `datasets/fire-8/remap.py` (0 stays fire, 1 is dropped, 2 becomes smoke). Scoring against un-remapped labels yields mAP 0.0000 with no smoke ground truth at all — which looks exactly like a quantization failure and is not one. `benchmarks/setup_colab.py` applies the remap so a fresh clone reproduces the local labels byte-for-byte (31 fire + 20 smoke across the 49 test images).
+Worth writing down because it cost a debugging session. The public fire-8 dataset ships labels with three categories, numbered 0 for fire, 1 for an unused category, and 2 for smoke. This model was trained on a two category version produced by `datasets/fire-8/remap.py`, where 0 stays fire, 1 is thrown away, and 2 becomes 1 for smoke.
 
-## Benchmark methodology
+Score the model against the original labels and you get 0.0000 with no smoke targets at all, which looks exactly like a quantization disaster and is nothing of the sort. `benchmarks/setup_colab.py` applies the same conversion so a fresh download matches the local labels exactly, 31 fire and 20 smoke boxes across the 49 test images.
 
-The latency numbers took four corrections to get right, which is worth recording because the wrong versions all looked plausible:
+## How the speed was measured
 
-1. **One process per runtime.** PyTorch, ONNX Runtime and OpenVINO each build a thread pool sized to the core count. Loaded into one process they oversubscribe the CPU — ONNX FP32 measured **360 ms** sharing a process, versus **34 ms** alone.
-2. **A settle gap between runtimes.** Even in separate processes, launching back to back leaves the previous runtime's threads winding down. ONNX FP32 measured **341 ms** immediately after a PyTorch run, versus **34 ms** after an 8-second pause.
-3. **Report the minimum.** Interference can only make a run slower, so the fastest observed time is the best estimate of real cost. An early run reported a *mean* of 272 ms against a *median* of 413 ms — a distribution that shape only happens when something else is stealing the CPU.
-4. **Enough samples, on AC power.** On battery the CPU throttles and run-to-run variance was large enough to reorder the table: one pass had OpenVINO FP32 at 30.4 ms and the next at 34.8 ms, flipping it either side of ONNX FP32. The final numbers are 120 samples per runtime on mains power, where the spread closes to a few percent.
+Getting believable timings took four corrections, and the wrong versions all looked perfectly reasonable.
 
-The result validates itself against the original M1 run on the same machine: PyTorch FP32 measures **42.4 ms** against **45.77 ms**, and OpenVINO FP32 **28.5 ms** against **30.57 ms**. (ONNX FP32 comes out faster than the original 40.10 ms, most likely a newer `onnxruntime` build.)
+1. **One library per process.** PyTorch, ONNX Runtime and OpenVINO each start a pool of worker threads sized to the number of CPU cores. Load them together and they fight over the same cores. ONNX measured **360 ms** sharing a process against **34 ms** on its own.
+2. **A pause between libraries.** Even in separate processes, starting one immediately after another catches the previous one still shutting down its threads. ONNX measured **341 ms** straight after a PyTorch run against **34 ms** after an eight second pause.
+3. **Report the fastest run, not the average.** Interference can only ever slow a run down, so the quickest time is the closest thing to the true cost. One early run reported an average of 272 ms against a median of 413 ms, a pattern that only happens when something else is stealing the processor.
+4. **Enough samples, on mains power.** On battery the processor throttles and the numbers moved enough to reorder the table, with one pass putting OpenVINO at 30.4 ms and the next at 34.8 ms. The final figures use 120 samples per library on mains power, where the spread narrows to a few percent.
 
-## Approach
+The result checks out against the original M1 measurements on the same laptop. PyTorch comes in at 42.4 ms against 45.77 ms, and OpenVINO at 28.5 ms against 30.57 ms. ONNX comes out faster than its original 40.10 ms, most likely a newer build of the library.
 
-**M2 (Quantization)** implements post-training static quantization from first principles rather than calling `torch.quantization`:
+## How it works
 
-- **Weights**: symmetric INT8, per-tensor or per-output-channel
-- **Activations**: asymmetric INT8, calibrated on 100 training images via forward hooks, at **every** `Conv` module rather than only the 23 top-level ones
-- **Requantization**: INT32 accumulation, per-channel multiplier `M[oc] = s_in · s_w[oc] · bn_gain[oc] / s_out`
+**M2, the quantization.** Written from first principles rather than calling a library function.
 
-**M3 (C++ Engine)** implements the operators needed to run YOLOv8n:
+- Weights are converted using one scale per filter, or optionally one scale for the whole layer
+- Activation ranges are measured by running 100 training images through the model and recording the highest and lowest values at **every** convolution, rather than only at the 23 top level blocks
+- Sums are accumulated in 32 bit whole numbers to avoid overflow, then converted back using a per channel multiplier that also carries the folded BatchNorm
 
-- `Tensor` carrying its own scale and zero-point, so ops cannot silently mix scales
-- Model loader for a custom binary + JSON format
-- Quantized `conv2d` with INT32 accumulation, folded BatchNorm, and fused activation
-- Element-wise ops (Concat with requantization, Upsample, MaxPool)
-- Compound blocks (Bottleneck, C2f, SPPF)
-- Detect head: DFL expectation, distance-to-box decoding, per-class NMS
+**M3, the C++ engine.**
+
+- A tensor type that carries its own scale and offset, so operations cannot silently mix incompatible numbers
+- A loader for a custom binary and JSON format
+- Convolution with 32 bit accumulation, folded BatchNorm, and the activation applied before rounding
+- Supporting operations for merging, upscaling and pooling feature maps
+- The compound blocks YOLOv8 is built from
+- The detection head, including box decoding and removal of duplicate boxes
 - JPEG in, annotated JPEG out
 
 ## Reproducing
 
 ```bash
-python quantization/calibrate.py                    # activation ranges -> activation_scales.json
-python quantization/save_model.py --per-channel     # -> model_int8_pc.{bin,json}
+python quantization/calibrate.py                    # measure activation ranges
+python quantization/save_model.py --per-channel     # write the quantized model
 cd cpp_engine && mkdir -p build && cd build && cmake .. && make
 
-# layer-by-layer validation
+# check the engine layer by layer against PyTorch
 ./custom_engine --input-bin ../../test_input.bin --dump-dir dumps_pc \
     --model-json ../../quantization/model_int8_pc.json \
     --model-bin  ../../quantization/model_int8_pc.bin
 python quantization/compare_layers.py --dumps cpp_engine/build/dumps_pc \
     --model quantization/model_int8_pc.json
 
-# end-to-end mAP
+# score it on the test set
 bash cpp_engine/run_both.sh
 python quantization/eval_map.py --csv cpp_engine/build/preds_pc/detections.csv
 
-# runtime comparison
+# compare against the production libraries
 python benchmarks/run_all_benchmarks.py
 ```
 
-## Repo contents
+## What is in here
 
-- `quantization/` — INT8 quantization pipeline (Python)
-  - `quantization.py` — quantize / dequantize / quantized_matmul
-  - `calibrate.py` — per-module activation calibration via forward hooks
-  - `save_model.py` — BatchNorm folding and serialization (`--per-channel`)
-  - `compare_layers.py` — layer-by-layer validation against PyTorch
-  - `eval_map.py` — mAP scoring for the engine and FP32 reference
-- `cpp_engine/` — the inference engine (M3)
-  - `tensor.h/cpp` — INT8 tensor carrying its quantization parameters
-  - `model.h/cpp` — model loader
-  - `ops.h/cpp` — convolution, blocks, Detect head, NMS
-  - `image_io.h/cpp` — JPEG decode, preprocessing, box drawing
-  - `main.cpp` — CLI
-  - `run_testset.sh`, `run_both.sh` — batch runners
-- `benchmarks/` — runtime comparison
-  - `bench_common.py` — shared preprocessing, NMS and scoring
-  - `bench_one.py` — benchmark a single runtime in isolation
-  - `run_all_benchmarks.py` — orchestrator, emits the table above
-  - `onnx_int8_benchmark.py`, `openvino_int8_benchmark.py` — INT8 quantization + benchmark
-  - `tensorrt_int8_colab.py` — TensorRT INT8, for a Colab GPU runtime
+- `quantization/`, the Python side
+  - `quantization.py`, the core conversion math
+  - `calibrate.py`, measures activation ranges
+  - `save_model.py`, folds BatchNorm and writes the model files
+  - `compare_layers.py`, checks the engine layer by layer against PyTorch
+  - `eval_map.py`, scores detections against the true boxes
+- `cpp_engine/`, the engine itself
+  - `tensor.h/cpp`, the tensor type
+  - `model.h/cpp`, the model loader
+  - `ops.h/cpp`, convolution, blocks, detection head and duplicate removal
+  - `image_io.h/cpp`, JPEG handling, image preparation and box drawing
+  - `main.cpp`, the command line interface
+  - `run_testset.sh` and `run_both.sh`, batch runners
+- `benchmarks/`, comparisons against production libraries
+  - `bench_common.py`, shared image preparation and scoring
+  - `bench_one.py`, times a single library in isolation
+  - `run_all_benchmarks.py`, runs them all and prints the table
+  - `onnx_int8_benchmark.py` and `openvino_int8_benchmark.py`, 8 bit conversion and timing
+  - `tensorrt_int8_colab.py` and `setup_colab.py`, the TensorRT run, for a Colab GPU
 
 ## Dataset
 
-[fire-8 from Abonia1](https://github.com/Abonia1/YOLOv8-Fire-and-Smoke-Detection) — 2-class fire and smoke detection dataset.
+[fire-8 from Abonia1](https://github.com/Abonia1/YOLOv8-Fire-and-Smoke-Detection), a two class fire and smoke detection dataset.
