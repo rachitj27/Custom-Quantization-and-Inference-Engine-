@@ -151,9 +151,18 @@ The reason is the same BatchNorm gain spread that caused defect 1. Filters withi
 
 This turned out to be the most interesting result in the project, because **two independent production toolchains both destroy this model when asked to quantize it with default settings** — and for the same structural reason as defect **4** above.
 
-**ONNX Runtime** scored **mAP 0.0000** on the first attempt while producing perfectly reasonable-looking box coordinates. The exported graph's final `Concat` merges box coordinates (0–640) with class scores (0–1) into one tensor. A single INT8 scale across that range is ~2.5 per step, so every class score rounds to zero. Restricting quantization to convolutions fixed it: **0.0000 → 0.8556**.
+**ONNX Runtime** scored **mAP 0.0000** on the first attempt. Inspecting the raw output tensor showed exactly where the damage was:
 
-**TensorRT** does the same thing and cannot be talked out of it as easily. Ultralytics' `int8=True` export hands the graph to ModelOpt, which quantizes `Add`, `Mul`, `Conv`, `Resize` and `MaxPool` — 200 nodes in all. That sweeps in the arithmetic of the Detect tail itself: the DFL expectation and the `anchor ± distance` box decoding are `Add`/`Mul` ops operating on values spanning 0–640. The engine builds fine, runs fast, and is useless:
+| | box rows (min/max) | class score rows (min/max) |
+|---|---|---|
+| FP32 | 6.70 / 634.43 | 0.0 / 0.751 |
+| INT8 (everything quantized) | 7.60 / 635.58 | **0.0 / 0.0** |
+
+The boxes were fine. **Every class score was exactly zero.** The exported graph's final `Concat` merges box coordinates (0–640) with class scores (0–1) into one tensor; a single INT8 scale across that range is ~2.5 per step, so every score — all of which are ≤ 1 — rounds to zero. Nothing clears the confidence threshold and the model detects nothing. Restricting quantization to convolutions fixed it: **0.0000 → 0.8556**.
+
+It is worth being precise about what is *not* the problem, because the intuitive answer is wrong. Rounding box coordinates to that same ~2.5 px grid is survivable: perturbing every edge of every ground-truth box by 2.51 px leaves median IoU at 0.925 (fire) and 0.963 (smoke), with **0%** of boxes dropping below the 0.5 matching threshold. INT8 ruins detectors through the *scores and the distribution logits*, not through coarse box coordinates.
+
+**TensorRT** fails the same way and cannot be talked out of it as easily. Ultralytics' `int8=True` export hands the graph to ModelOpt, which quantizes `Add`, `Mul`, `Conv`, `Resize` and `MaxPool` — 200 nodes in all — sweeping in the Detect tail's own arithmetic, including the DFL softmax over 16 distance bins per box edge. The engine builds fine, runs fast, and is useless:
 
 | | fire AP@0.5 | smoke AP@0.5 | mAP@0.5 |
 |---|---|---|---|
@@ -161,6 +170,8 @@ This turned out to be the most interesting result in the project, because **two 
 | TensorRT INT8 on the same T4 | 0.0000 | 0.1667 | **0.0833** |
 
 That FP32 row is a control, run through the *identical* preprocessing, NMS and scoring code on the same machine, and it reproduces the laptop CPU result exactly (0.7742 / 0.9976). So the collapse is real, not a harness artifact — a 4.4 ms inference that finds essentially nothing.
+
+The exact mechanism inside TensorRT was not isolated the way it was for ONNX Runtime; ModelOpt reports "finding concat eliminated tensors", so it evidently does not crush the scores as bluntly, which fits 0.0833 rather than a clean 0.0000. The pattern of failure is suggestive though: fire scores 0.0000 while smoke — whose boxes cover a median 70% of the frame against fire's 16% — still scrapes 0.1667. That is what class confusion looks like, where a wrongly-labelled box is large enough to overlap something. Confirming it would mean driving ModelOpt directly rather than through Ultralytics.
 
 The custom engine keeps the whole Detect head — DFL softmax, distance-to-box decoding, NMS — in FP32 by construction, which is precisely why it out-scores every production INT8 pipeline measured here. Quantizing a detector is not one decision applied uniformly to a graph; the box-decode arithmetic has a dynamic range that INT8 cannot hold, and a pipeline that does not know where the network stops being convolutions will quantize straight through it.
 
