@@ -89,7 +89,8 @@ GPU results are listed separately because a data centre GPU and a laptop CPU are
 | Runtime | Precision | Best | Median | mAP@0.5 |
 |---------|-----------|------|--------|---------|
 | PyTorch (Ultralytics), T4 | FP32 | 8.0 ms | 8.1 ms | 0.8859 |
-| **TensorRT, T4** | **INT8** | **4.4 ms** | 5.1 ms | **0.0833** |
+| TensorRT, T4, default export | INT8 | 4.4 ms | 5.1 ms | 0.0833 |
+| **TensorRT, T4, convolutions only** | **INT8** | **4.9 ms** | 6.4 ms | **0.8656** |
 | TensorRT, T4 | FP16 | 12.4 ms | not re-measured | carried over from M1 |
 
 What the numbers say.
@@ -98,7 +99,7 @@ What the numbers say.
 - **ONNX Runtime INT8 is slightly slower than its own full precision build**, 30.8 ms against 24.1 ms, and that held across every measurement run. Only the convolutions could be quantized safely, so the graph pays the cost of converting numbers back and forth around all 64 of them without ever getting to run one long stretch of pure integer math. Going to 8 bit does not automatically make things faster. It depends on whether the library can actually use the result.
 - **This engine is roughly 250 times slower than OpenVINO.** It is six nested loops with no vectorization, no threading, and no memory tricks. Speeding it up is what M4 is for. Worth noting though that it is only about 12% slower than the earlier, broken version of itself, despite now doing considerably more work.
 - The two rows for this engine differ by about 3%, which confirms that per channel weights are effectively free at runtime.
-- **TensorRT INT8 is the fastest result anywhere in this project at 4.4 ms, and also by far the least accurate at 0.0833.** A default export destroys this model. That story is below.
+- **TensorRT INT8 is the fastest result anywhere in this project, and the difference between the two TensorRT rows is the whole point of this repo.** The default export runs at 4.4 ms and scores 0.0833, which is useless. Telling the quantizer to touch convolutions only costs 0.5 ms and takes the score to 0.8656, which is 97.7% of full precision. Same model, same hardware, same calibration images. The only difference is which parts of the network were converted to 8 bit.
 
 ## Fixing the accuracy
 
@@ -155,18 +156,21 @@ The boxes were fine. **Every confidence score was exactly zero.** At the very en
 
 It is worth being clear about what is *not* the problem here, because the obvious guess is wrong. Rounding the box coordinates onto that same coarse grid is survivable. Shifting every edge of every true box by 2.51 pixels still leaves an average overlap of 0.925 for fire and 0.963 for smoke, and **not a single box** falls below the 0.5 threshold that counts as a match. Eight bit precision ruins detectors through the confidence scores, not through blurry box coordinates.
 
-**TensorRT** fails the same way and is harder to talk out of it. The standard export path quantizes 200 operations including the arithmetic that turns raw network output into box coordinates. The result builds cleanly, runs faster than anything else measured here, and finds almost nothing.
+**TensorRT** fails the same way with its standard settings. Ultralytics' 8 bit export hands the model to NVIDIA's quantization toolkit, which converts 200 operations including the arithmetic that turns raw network output into box coordinates. The result builds cleanly, runs faster than anything else measured here, and finds almost nothing.
 
-| | fire | smoke | mAP@0.5 |
-|---|---|---|---|
-| Full precision on the same T4 | 0.7742 | 0.9976 | **0.8859** |
-| TensorRT 8 bit on the same T4 | 0.0000 | 0.1667 | **0.0833** |
+So the same experiment was run again, driving the toolkit directly and telling it to convert **convolutions only**, which drops the count from 200 nodes to 80 and leaves the detection head untouched. That is the same scoping that rescued ONNX Runtime, and the same thing this engine does by design.
 
-That first row is a control. It ran through the *same* image preparation and scoring code on the *same* machine, and it reproduces the laptop result exactly. So the collapse is real and not a measurement mistake.
+| | fire | smoke | mAP@0.5 | Best latency |
+|---|---|---|---|---|
+| Full precision on the T4 | 0.7742 | 0.9976 | **0.8859** | 8.0 ms |
+| 8 bit, everything converted | 0.0000 | 0.1667 | **0.0833** | 4.4 ms |
+| 8 bit, convolutions only | 0.7312 | 1.0000 | **0.8656** | 4.9 ms |
 
-The precise mechanism inside TensorRT was not pinned down the way it was for ONNX Runtime, and its toolchain handles that final merge differently, which fits a score of 0.0833 rather than a clean zero. The shape of the failure is suggestive though. Fire scores nothing while smoke still manages 0.1667, and smoke boxes cover about 70% of the image on average against fire's 16%. That is what it looks like when labels get swapped and a mislabelled box is simply big enough to overlap something by accident. Confirming that would mean using the quantization toolkit directly instead of through Ultralytics.
+The first row is a control. It ran through the *same* image preparation and scoring code on the *same* machine, and it reproduces the laptop result exactly, so none of this is a measurement mistake.
 
-None of this means TensorRT is bad. It means the default settings are wrong for this kind of model. This engine keeps the entire detection head in full precision by design, which is exactly why it scores higher than every professional 8 bit pipeline measured here. Quantizing a detector is not one decision applied evenly across a network. The final box decoding step needs a range of values that 8 bits cannot hold, and a tool that does not know where the convolutions stop will quantize straight through it.
+The last row is the punchline. **Scoping the conversion correctly costs half a millisecond and recovers essentially all of the accuracy**, landing at 97.7% of full precision while still running 1.6 times faster than the full precision model. It is the fastest usable configuration measured anywhere in this project.
+
+That is the whole lesson. TensorRT is not bad and 8 bit is not the problem. Quantizing a detector is not one decision applied evenly across a network. The box decoding at the end needs a range of values that 8 bits cannot hold, and a tool pointed at the whole graph will convert straight through it. Getting this right is why the hand written engine, which keeps the entire detection head in full precision because it was written that way from the start, beats every automated 8 bit pipeline running with default settings.
 
 ## A trap in the dataset labels
 
