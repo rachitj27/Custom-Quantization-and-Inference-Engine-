@@ -8,6 +8,9 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Lets the editor resolve includes and flags exactly as the build does.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 add_compile_options(-Wall -Wextra -O2)
 
 find_package(nlohmann_json 3.2.0 REQUIRED)
