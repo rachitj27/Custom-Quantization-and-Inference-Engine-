@@ -23,7 +23,7 @@ Detections: 1
 
 **M2, 8 bit quantization written from scratch.** Rather than calling `torch.quantization`, this implements the underlying math directly.
 
-- Converting weights to 8 bit, both with one scale per layer and with one scale per filter
+- Converting weights to 8 bit, both per-tensor and per-channel
 - Measuring the range of every activation in the network by running calibration images through it and recording what actually flows through each layer
 - Folding BatchNorm into the convolution so it costs nothing at runtime
 - Integer accumulation with the requantization arithmetic that converts back to real values
@@ -47,10 +47,10 @@ The engine keeps **99.6% of the original model's accuracy**. The metric is mAP@0
 | Configuration | mAP@0.5 | vs full precision |
 |---|---|---|
 | Original 32 bit model | 0.8859 | reference |
-| **This engine, one scale per filter** | **0.8826** | **99.6%** |
-| This engine, one scale per layer | 0.7680 | 86.7% |
+| **This engine, per-channel weights** | **0.8826** | **99.6%** |
+| This engine, per-tensor weights | 0.7680 | 86.7% |
 
-Choosing one scale per filter rather than one per layer is what closes most of the gap. Filters within a single layer can differ in magnitude by more than a factor of ten, so a shared scale is set by the loudest one and forces the quietest into a handful of the 256 available steps. Per filter costs four bytes per channel of metadata and nothing at runtime.
+Per-channel weights are what close most of the gap. Per-tensor gives a whole layer one shared scale, while per-channel gives each output channel its own. Since the filters within a layer can differ in magnitude by more than a factor of ten, a shared scale is set by the loudest filter and forces the quietest ones into a handful of the 256 available steps. Per-channel costs four bytes per output channel of metadata and nothing at runtime, because the multiplier that converts the accumulator back to real values is already per-channel.
 
 For reference, the same model converted to 8 bit by production libraries scores 0.8556 with ONNX Runtime and 0.8089 with OpenVINO.
 

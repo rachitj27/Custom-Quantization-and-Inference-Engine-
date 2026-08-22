@@ -6,8 +6,9 @@
 //                                              layer-parity validation mode
 //   ./custom_engine image.jpg --bench 5        time the forward pass
 //
-// Model files default to ../../quantization/ and can be overridden with
-// --model-json / --model-bin.
+// Model files are found automatically in ../../quantization/, preferring the
+// more accurate per-channel model, and can be overridden with --model-json and
+// --model-bin.
 
 #include <chrono>
 #include <cstring>
@@ -46,9 +47,9 @@ bool file_exists(const std::string& p) {
     return f.good();
 }
 
-// Locate a model file without depending on the working directory: look next to
+// Locate a model file without depending on the working directory. Looks next to
 // the executable first, then relative to wherever we were invoked from.
-std::string find_model_file(const std::string& argv0, const std::string& filename) {
+std::string find_in_usual_places(const std::string& argv0, const std::string& filename) {
     std::string exe_dir = ".";
     const size_t slash = argv0.find_last_of("/\\");
     if (slash != std::string::npos) exe_dir = argv0.substr(0, slash);
@@ -64,7 +65,24 @@ std::string find_model_file(const std::string& argv0, const std::string& filenam
     for (const std::string& c : candidates) {
         if (file_exists(c)) return c;
     }
-    return candidates[0];  // report the expected location in the error
+    return std::string();
+}
+
+// Prefer the per-channel model, which scores 0.8826 against 0.7680 for the
+// per-tensor one. Running the less accurate model by default just because its
+// filename is shorter is a trap, so the accurate one wins and per-tensor is
+// still reachable with --model-json / --model-bin.
+std::string find_model_file(const std::string& argv0, const std::string& suffix) {
+    const std::string preferred = "model_int8_pc" + suffix;
+    const std::string fallback = "model_int8" + suffix;
+
+    std::string path = find_in_usual_places(argv0, preferred);
+    if (!path.empty()) return path;
+
+    path = find_in_usual_places(argv0, fallback);
+    if (!path.empty()) return path;
+
+    return "../../quantization/" + preferred;  // name the expected location
 }
 
 void print_usage() {
@@ -155,8 +173,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (opt.model_json.empty()) opt.model_json = find_model_file(argv[0], "model_int8.json");
-    if (opt.model_bin.empty()) opt.model_bin = find_model_file(argv[0], "model_int8.bin");
+    if (opt.model_json.empty()) opt.model_json = find_model_file(argv[0], ".json");
+    if (opt.model_bin.empty()) opt.model_bin = find_model_file(argv[0], ".bin");
 
     try {
         Model model = load_model_metadata(opt.model_json);
