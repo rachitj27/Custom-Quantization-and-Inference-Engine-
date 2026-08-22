@@ -14,8 +14,14 @@ Give it a photo and it draws boxes around the fire and smoke it finds.
 Loaded fire.jpg (640x640)
 Inference: 3516.4 ms
 Detections: 1
-  fire   0.830  box=[329.2, 158.6, 532.6, 585.8]
+  fire   0.733  box=[328.4, 179.6, 528.3, 581.4]
 ```
+
+| | |
+|---|---|
+| ![fire detected at 73 percent](docs/examples/fire.jpg) | ![smoke detected at 90 percent](docs/examples/smoke.jpg) |
+
+Red for fire, blue for smoke, with the class and confidence drawn on the box. Both of these came out of the engine as shown, no post processing.
 
 ## Milestones
 
@@ -76,21 +82,13 @@ The weights are 8 bit, stored and loaded as raw bytes and never converted to flo
 
 The conversion between layers is floating point, and so is the detection head. The head is deliberate. Box coordinates run from 0 to 640 while confidence scores run from 0 to 1, and a single 8 bit scale cannot represent both, so decoding stays in full precision.
 
-## What is next, closing the speed gap
+## What is next
 
-The model needs 4.04 billion multiply accumulates per image. This engine gets through 1.15 billion of them per second. OpenVINO manages 291 billion, and the ceiling for this laptop's processor is somewhere around 1500 billion. That gap breaks down into named techniques rather than mystery, and working through them is the point of the next phase.
+Writing CUDA GEMM kernels to make the engine fast on a GPU.
 
-| Technique | What it addresses |
-|---|---|
-| Loop reordering for a contiguous inner loop | cache behaviour, currently close to worst case |
-| im2col plus a blocked matrix multiply | how real engines implement convolution |
-| AVX2 VNNI intrinsics | the actual reason 8 bit arithmetic is fast |
-| Multithreading | using more than one of eight cores |
-| Fixed point requantization | the conversion path, once convolution is fast |
+The current engine is a correctness first implementation, six nested loops with no vectorization, no threading and no cache blocking. It gets through 1.15 billion multiply accumulates per second against the 4.04 billion the model needs per image. The plan is to restructure the convolution as a matrix multiply and write the kernels for it, which is how real engines get their speed.
 
-Profiling the model first turned up something useful. The detection head accounts for 36.6% of all the arithmetic, and its four highest resolution convolutions are the four most expensive operations in the whole network. The backbone is not the bottleneck here.
-
-Accuracy is protected while this work happens. Layer by layer comparison against PyTorch plus end to end scoring over the test set means any optimization that breaks correctness shows up immediately rather than several stages later.
+Accuracy is protected while that happens. Layer by layer comparison against PyTorch plus end to end scoring over the test set means any kernel that breaks correctness shows up immediately rather than several stages later.
 
 ## Reproducing
 

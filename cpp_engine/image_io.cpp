@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <string>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "third_party/stb_image.h"
@@ -34,6 +35,106 @@ void set_pixel(Image& img, int x, int y, const unsigned char* colour) {
     img.rgb[i + 0] = colour[0];
     img.rgb[i + 1] = colour[1];
     img.rgb[i + 2] = colour[2];
+}
+
+void fill_rect(Image& img, int x0, int y0, int x1, int y1, const unsigned char* colour) {
+    for (int y = y0; y < y1; y++) {
+        for (int x = x0; x < x1; x++) set_pixel(img, x, y, colour);
+    }
+}
+
+// A 5x7 bitmap font, one byte per column, bit 0 is the top row. Covers ASCII 32
+// to 90, which is space through 'Z'. Lowercase is drawn as uppercase, which is
+// all the labels need.
+constexpr int kGlyphW = 5;
+constexpr int kGlyphH = 7;
+const unsigned char kFont[59][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, // space
+    {0x00,0x00,0x5F,0x00,0x00}, // !
+    {0x00,0x07,0x00,0x07,0x00}, // "
+    {0x14,0x7F,0x14,0x7F,0x14}, // #
+    {0x24,0x2A,0x7F,0x2A,0x12}, // $
+    {0x23,0x13,0x08,0x64,0x62}, // %
+    {0x36,0x49,0x55,0x22,0x50}, // &
+    {0x00,0x05,0x03,0x00,0x00}, // '
+    {0x00,0x1C,0x22,0x41,0x00}, // (
+    {0x00,0x41,0x22,0x1C,0x00}, // )
+    {0x14,0x08,0x3E,0x08,0x14}, // *
+    {0x08,0x08,0x3E,0x08,0x08}, // +
+    {0x00,0x50,0x30,0x00,0x00}, // ,
+    {0x08,0x08,0x08,0x08,0x08}, // -
+    {0x00,0x60,0x60,0x00,0x00}, // .
+    {0x20,0x10,0x08,0x04,0x02}, // /
+    {0x3E,0x51,0x49,0x45,0x3E}, // 0
+    {0x00,0x42,0x7F,0x40,0x00}, // 1
+    {0x42,0x61,0x51,0x49,0x46}, // 2
+    {0x21,0x41,0x45,0x4B,0x31}, // 3
+    {0x18,0x14,0x12,0x7F,0x10}, // 4
+    {0x27,0x45,0x45,0x45,0x39}, // 5
+    {0x3C,0x4A,0x49,0x49,0x30}, // 6
+    {0x01,0x71,0x09,0x05,0x03}, // 7
+    {0x36,0x49,0x49,0x49,0x36}, // 8
+    {0x06,0x49,0x49,0x29,0x1E}, // 9
+    {0x00,0x36,0x36,0x00,0x00}, // :
+    {0x00,0x56,0x36,0x00,0x00}, // ;
+    {0x08,0x14,0x22,0x41,0x00}, // <
+    {0x14,0x14,0x14,0x14,0x14}, // =
+    {0x00,0x41,0x22,0x14,0x08}, // >
+    {0x02,0x01,0x51,0x09,0x06}, // ?
+    {0x32,0x49,0x79,0x41,0x3E}, // @
+    {0x7E,0x11,0x11,0x11,0x7E}, // A
+    {0x7F,0x49,0x49,0x49,0x36}, // B
+    {0x3E,0x41,0x41,0x41,0x22}, // C
+    {0x7F,0x41,0x41,0x22,0x1C}, // D
+    {0x7F,0x49,0x49,0x49,0x41}, // E
+    {0x7F,0x09,0x09,0x09,0x01}, // F
+    {0x3E,0x41,0x49,0x49,0x7A}, // G
+    {0x7F,0x08,0x08,0x08,0x7F}, // H
+    {0x00,0x41,0x7F,0x41,0x00}, // I
+    {0x20,0x40,0x41,0x3F,0x01}, // J
+    {0x7F,0x08,0x14,0x22,0x41}, // K
+    {0x7F,0x40,0x40,0x40,0x40}, // L
+    {0x7F,0x02,0x0C,0x02,0x7F}, // M
+    {0x7F,0x04,0x08,0x10,0x7F}, // N
+    {0x3E,0x41,0x41,0x41,0x3E}, // O
+    {0x7F,0x09,0x09,0x09,0x06}, // P
+    {0x3E,0x41,0x51,0x21,0x5E}, // Q
+    {0x7F,0x09,0x19,0x29,0x46}, // R
+    {0x46,0x49,0x49,0x49,0x31}, // S
+    {0x01,0x01,0x7F,0x01,0x01}, // T
+    {0x3F,0x40,0x40,0x40,0x3F}, // U
+    {0x1F,0x20,0x40,0x20,0x1F}, // V
+    {0x3F,0x40,0x38,0x40,0x3F}, // W
+    {0x63,0x14,0x08,0x14,0x63}, // X
+    {0x07,0x08,0x70,0x08,0x07}, // Y
+    {0x61,0x51,0x49,0x45,0x43}, // Z
+};
+
+int text_width(const std::string& s, int scale) {
+    if (s.empty()) return 0;
+    return static_cast<int>(s.size()) * (kGlyphW + 1) * scale - scale;
+}
+
+void draw_text(Image& img, int x, int y, const std::string& s, int scale,
+               const unsigned char* colour) {
+    int cx = x;
+    for (char raw : s) {
+        char ch = raw;
+        if (ch >= 'a' && ch <= 'z') ch -= 32;  // the font is uppercase only
+        const int idx = ch - 32;
+        if (idx >= 0 && idx < static_cast<int>(sizeof(kFont) / sizeof(kFont[0]))) {
+            for (int col = 0; col < kGlyphW; col++) {
+                const unsigned char bits = kFont[idx][col];
+                for (int row = 0; row < kGlyphH; row++) {
+                    if (bits & (1u << row)) {
+                        fill_rect(img, cx + col * scale, y + row * scale,
+                                  cx + (col + 1) * scale, y + (row + 1) * scale, colour);
+                    }
+                }
+            }
+        }
+        cx += (kGlyphW + 1) * scale;
+    }
 }
 
 }  // namespace
@@ -114,14 +215,17 @@ std::unique_ptr<Tensor> preprocess(const Image& img, int size, const Model& mode
 
 void draw_detections(Image& img, const std::vector<Detection>& dets, int net_size,
                      const std::vector<std::string>& class_names) {
-    (void)class_names;  // labels are reported on stdout; the box is colour-coded
-
     // Boxes come back in network pixels; map them onto the original image.
     const float sx = static_cast<float>(img.width) / static_cast<float>(net_size);
     const float sy = static_cast<float>(img.height) / static_cast<float>(net_size);
 
-    // Thicker outline on bigger images so it stays visible.
-    const int thickness = std::max(2, std::min(img.width, img.height) / 250);
+    // Scale the outline and the label with the image so both stay readable.
+    const int shorter = std::min(img.width, img.height);
+    const int thickness = std::max(2, shorter / 200);
+    const int scale = std::max(2, shorter / 180);
+
+    const unsigned char white[3] = {255, 255, 255};
+    const unsigned char black[3] = {0, 0, 0};
 
     for (const Detection& d : dets) {
         const unsigned char* colour = kPalette[d.cls % kPaletteSize];
@@ -149,14 +253,28 @@ void draw_detections(Image& img, const std::vector<Detection>& dets, int net_siz
             }
         }
 
-        // Solid tag in the top-left corner of the box: its length scales with
-        // confidence, so a glance shows how sure the engine is.
-        const int tag_h = std::max(4, thickness * 3);
-        const int tag_w = static_cast<int>((x2 - x1) * std::clamp(d.score, 0.0f, 1.0f));
-        for (int y = y1; y < y1 + tag_h; y++) {
-            for (int x = x1; x < x1 + tag_w; x++) {
-                set_pixel(img, x, y, colour);
-            }
-        }
+        // Label reads "FIRE 83%".
+        std::string name = (d.cls < static_cast<int>(class_names.size()))
+                               ? class_names[d.cls]
+                               : ("CLASS" + std::to_string(d.cls));
+        const int pct = static_cast<int>(std::lround(std::clamp(d.score, 0.0f, 1.0f) * 100.0f));
+        const std::string label = name + " " + std::to_string(pct) + "%";
+
+        const int pad = std::max(2, scale);
+        const int box_w = text_width(label, scale) + pad * 2;
+        const int box_h = kGlyphH * scale + pad * 2;
+
+        // Sit the label above the box, or just inside it when there is no room.
+        int lx = x1;
+        int ly = y1 - box_h;
+        if (ly < 0) ly = y1 + thickness;
+        lx = std::clamp(lx, 0, std::max(0, img.width - box_w));
+
+        fill_rect(img, lx, ly, lx + box_w, ly + box_h, colour);
+
+        // Dark text on light fills, light text on dark ones, so it stays legible
+        // whichever colour the class happens to be.
+        const int luma = (colour[0] * 299 + colour[1] * 587 + colour[2] * 114) / 1000;
+        draw_text(img, lx + pad, ly + pad, label, scale, luma > 140 ? black : white);
     }
 }
