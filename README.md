@@ -114,4 +114,4 @@ Requires `cmake`, a C++17 compiler and `nlohmann-json`. Image handling uses [stb
 
 ## Dataset
 
-[fire-8 from Abonia1](https://github.com/Abonia1/YOLOv8-Fire-and-Smoke-Detection), a two class fire and smoke detection dataset. The model is YOLOv8n fine tuned for 50 epochs, 3.0M parameters. Its weights take 12.0 MB as 32 bit decimals and 3.0 MB as 8 bit integers, four times smaller.
+[fire-8 from Abonia1](https://github.com/Abonia1/YOLOv8-Fire-and-Smoke-Detection), a two class fire and smoke detection dataset. The model is YOLOv8n fine tuned for 50 epochs, 3.0M parameters. Its weights take 12.0 MB as 32 bit decimals and 3.0 MB as 8 bit integers, four times smaller. The checkpoint file on disk is only 6.2 MB because Ultralytics stores it at half precision and converts back to 32 bit when the model is loaded.
