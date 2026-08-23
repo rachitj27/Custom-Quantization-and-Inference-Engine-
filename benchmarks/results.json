@@ -1,0 +1,122 @@
+[
+  {
+    "label": "PyTorch (Ultralytics) FP32",
+    "min_ms": 42.407500000990694,
+    "median_ms": 58.505150000200956,
+    "mean_ms": 58.340239166712614,
+    "map50": 0.8859062980030722,
+    "per_class": {
+      "fire": 0.7741935483870968,
+      "smoke": 0.9976190476190476
+    },
+    "n_samples": 120
+  },
+  {
+    "label": "ONNX Runtime FP32",
+    "min_ms": 24.06390000032843,
+    "median_ms": 28.44455000013113,
+    "mean_ms": 28.957130833623523,
+    "map50": 0.8859062980030722,
+    "per_class": {
+      "fire": 0.7741935483870968,
+      "smoke": 0.9976190476190476
+    },
+    "n_samples": 120
+  },
+  {
+    "label": "ONNX Runtime INT8",
+    "min_ms": 30.753399998502573,
+    "median_ms": 35.80080000028829,
+    "mean_ms": 36.403524999968795,
+    "map50": 0.8555754413202232,
+    "per_class": {
+      "fire": 0.7352150537634409,
+      "smoke": 0.9759358288770055
+    },
+    "n_samples": 120
+  },
+  {
+    "label": "OpenVINO FP32",
+    "min_ms": 28.519399998913286,
+    "median_ms": 33.256899998377776,
+    "mean_ms": 34.17656749995027,
+    "map50": 0.8859062980030722,
+    "per_class": {
+      "fire": 0.7741935483870968,
+      "smoke": 0.9976190476190476
+    },
+    "n_samples": 120
+  },
+  {
+    "label": "OpenVINO INT8",
+    "min_ms": 13.889900001231581,
+    "median_ms": 16.41974999984086,
+    "mean_ms": 17.091280000052695,
+    "map50": 0.8088771443610153,
+    "per_class": {
+      "fire": 0.7126260835938255,
+      "smoke": 0.9051282051282051
+    },
+    "n_samples": 120
+  },
+  {
+    "label": "Custom C++ engine (per-channel) INT8",
+    "min_ms": 3516.4,
+    "median_ms": 3537.1,
+    "mean_ms": 3537.1,
+    "map50": 0.8826,
+    "per_class": {
+      "fire": 0.7742,
+      "smoke": 0.9909
+    },
+    "note": "cpp_engine/build/custom_engine --bench 6 on AC power; mAP via quantization/eval_map.py over the full test set"
+  },
+  {
+    "label": "Custom C++ engine (per-tensor) INT8",
+    "min_ms": 3418.1,
+    "median_ms": 3461.4,
+    "mean_ms": 3461.4,
+    "map50": 0.768,
+    "per_class": {
+      "fire": 0.5935,
+      "smoke": 0.9426
+    },
+    "note": "original weight-quantization scheme, kept for comparison"
+  },
+  {
+    "label": "PyTorch (Ultralytics), T4 FP32",
+    "min_ms": 8.0,
+    "median_ms": 8.1,
+    "mean_ms": 8.1,
+    "map50": 0.8859,
+    "per_class": {
+      "fire": 0.7742,
+      "smoke": 0.9976
+    },
+    "note": "Colab Tesla T4; control run proving the harness reproduces the CPU FP32 result"
+  },
+  {
+    "label": "TensorRT, T4, default export INT8",
+    "min_ms": 4.4,
+    "median_ms": 5.1,
+    "mean_ms": 5.1,
+    "map50": 0.0833,
+    "per_class": {
+      "fire": 0.0,
+      "smoke": 0.1667
+    },
+    "note": "Ultralytics int8=True; quantizes 200 nodes including the box decode arithmetic"
+  },
+  {
+    "label": "TensorRT, T4, convolutions only INT8",
+    "min_ms": 4.9,
+    "median_ms": 6.4,
+    "mean_ms": 6.4,
+    "map50": 0.8656,
+    "per_class": {
+      "fire": 0.7312,
+      "smoke": 1.0
+    },
+    "note": "ModelOpt driven directly with op_types_to_quantize=['Conv'], 80 quantized nodes; 97.7% of FP32"
+  }
+]

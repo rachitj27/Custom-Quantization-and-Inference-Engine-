@@ -1,151 +1,170 @@
 #include "ops.h"
-#include "model.h"
-#include <stdexcept>
+
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <numeric>
+#include <stdexcept>
 
-std::unique_ptr<Tensor> conv2d(
-    const Tensor& input,
-    const Tensor& weights,
-    int stride,
-    int padding,
-    float input_scale,
-    float weight_scale,
-    float output_scale,
-    int output_zero_point
-) {
-    int in_channels  = input.shape[0];
-    int in_height    = input.shape[1];
-    int in_width     = input.shape[2];
+namespace {
 
-    int out_channels = weights.shape[0];
-    int weight_in_ch = weights.shape[1];
-    int kernel_h     = weights.shape[2];
-    int kernel_w     = weights.shape[3];
+inline int8_t quantize_one(float real, float scale, int zero_point) {
+    int32_t q = static_cast<int32_t>(std::lround(real / scale)) + zero_point;
+    if (q > 127) q = 127;
+    if (q < -128) q = -128;
+    return static_cast<int8_t>(q);
+}
 
-    if (in_channels != weight_in_ch) {
-        throw std::runtime_error("Input channels do not match weight in_channels");
+inline float silu(float x) {
+    return x / (1.0f + std::exp(-x));
+}
+
+// Shared INT8 convolution core. Produces real-valued (dequantized) outputs with
+// folded BatchNorm and the optional activation already applied.
+FloatTensor conv2d_real(const Tensor& input, const Layer& layer, bool apply_silu) {
+    const int in_ch = input.shape[0];
+    const int in_h = input.shape[1];
+    const int in_w = input.shape[2];
+
+    const int out_ch = layer.weight_shape[0];
+    const int w_in_ch = layer.weight_shape[1];
+    const int kh = layer.weight_shape[2];
+    const int kw = layer.weight_shape[3];
+
+    if (layer.groups != 1) {
+        throw std::runtime_error("Grouped convolution is not supported: " + layer.path);
+    }
+    if (in_ch != w_in_ch) {
+        throw std::runtime_error("Channel mismatch at " + layer.path + ": input has " +
+                                 std::to_string(in_ch) + ", weights expect " +
+                                 std::to_string(w_in_ch));
     }
 
-    int out_height = (in_height + 2 * padding - kernel_h) / stride + 1;
-    int out_width  = (in_width  + 2 * padding - kernel_w) / stride + 1;
+    const int stride = layer.stride;
+    const int pad = layer.padding;
+    const int out_h = (in_h + 2 * pad - kh) / stride + 1;
+    const int out_w = (in_w + 2 * pad - kw) / stride + 1;
 
-    auto output = std::make_unique<Tensor>(std::vector<int>{out_channels, out_height, out_width});
-    //main 6 nested for loops to do the convolution
-    for (int oc = 0; oc < out_channels; oc++) {
-        for (int oh = 0; oh < out_height; oh++) {
-            for (int ow = 0; ow < out_width; ow++) {
+    FloatTensor out({out_ch, out_h, out_w});
+
+    const int z_in = input.zero_point;
+    const int8_t* w = layer.weights->data;
+
+    for (int oc = 0; oc < out_ch; oc++) {
+        // Dequantization multiplier folded together with the BatchNorm gain, so
+        // per-channel weight scales cost nothing beyond this one multiply.
+        const float m = input.scale * layer.weight_scales[oc] * layer.bn_gain[oc];
+        const float bias = layer.bn_bias[oc];
+        const int8_t* w_oc = w + static_cast<size_t>(oc) * in_ch * kh * kw;
+
+        for (int oh = 0; oh < out_h; oh++) {
+            for (int ow = 0; ow < out_w; ow++) {
                 int32_t acc = 0;
 
-                for (int ic = 0; ic < in_channels; ic++) {
-                    for (int kh = 0; kh < kernel_h; kh++) {
-                        for (int kw = 0; kw < kernel_w; kw++) {
-                            int ih = oh * stride + kh - padding;
-                            int iw = ow * stride + kw - padding;
+                for (int ic = 0; ic < in_ch; ic++) {
+                    const int8_t* w_ic = w_oc + static_cast<size_t>(ic) * kh * kw;
+                    const int8_t* in_c = input.data + static_cast<size_t>(ic) * in_h * in_w;
 
-                            if (ih < 0 || ih >= in_height || iw < 0 || iw >= in_width) {
-                                continue;
-                            }
+                    for (int r = 0; r < kh; r++) {
+                        const int ih = oh * stride + r - pad;
+                        if (ih < 0 || ih >= in_h) continue;  // padded: contributes 0
 
-                            int input_idx = ic * (in_height * in_width) + ih * in_width + iw;
-                            int weight_idx = oc * (in_channels * kernel_h * kernel_w)
-                                           + ic * (kernel_h * kernel_w)
-                                           + kh * kernel_w
-                                           + kw;
+                        for (int c = 0; c < kw; c++) {
+                            const int iw = ow * stride + c - pad;
+                            if (iw < 0 || iw >= in_w) continue;
 
-                            acc += (int32_t)input.data[input_idx] * (int32_t)weights.data[weight_idx];
+                            const int q_in = static_cast<int>(in_c[ih * in_w + iw]);
+                            const int q_w = static_cast<int>(w_ic[r * kw + c]);
+                            acc += static_cast<int32_t>(q_in - z_in) * static_cast<int32_t>(q_w);
                         }
                     }
                 }
 
-            // Compute the combined scale factor
-            float M = input_scale * weight_scale / output_scale;
-            // Requantization math with no scale factor
-            int32_t requantized = (int32_t)std::round(M * acc) + output_zero_point;
-
-            // Clamp to INT8 range just in case of floating point rounding mistakes or calibration values out of range of what quantizatio was done with
-            if (requantized > 127) requantized = 127;
-            if (requantized < -128) requantized = -128;
-
-            int output_idx = oc * (out_height * out_width) + oh * out_width + ow;
-            output->data[output_idx] = (int8_t)requantized;
+                float value = m * static_cast<float>(acc) + bias;
+                if (apply_silu) value = silu(value);
+                out.data[(static_cast<size_t>(oc) * out_h + oh) * out_w + ow] = value;
             }
         }
     }
 
-    return output;
-}
-void silu_inplace(
-    Tensor& tensor,
-    float input_scale,
-    int input_zero_point,
-    float output_scale,
-    int output_zero_point
-) {
-    
-    // For each of the 256 possible input values, compute the SiLU result
-    int8_t lookup[256];
-    for (int i = -128; i <= 127; i++) {
-        // Dequantize input value to FP32
-        float x_fp32 = input_scale * (i - input_zero_point);
-        
-        // Apply SiLU: x * sigmoid(x)
-        float sigmoid = 1.0f / (1.0f + std::exp(-x_fp32));
-        float silu = x_fp32 * sigmoid;
-        
-        // Requantize to INT8
-        int32_t q = (int32_t)std::round(silu / output_scale) + output_zero_point;
-        if (q > 127) q = 127;
-        if (q < -128) q = -128;
-        
-        lookup[i + 128] = (int8_t)q;
-    }
-    
-    // Apply lookup to every element in the tensor
-    for (size_t i = 0; i < tensor.num_elements; i++) {
-        int idx = tensor.data[i] + 128;  // shift to 0-255 range
-        tensor.data[i] = lookup[idx];
-    }
-}
-std::unique_ptr<Tensor> upsample2x(const Tensor& input) {
-    // Input shape: (channels, height, width)
-    // Output shape: (channels, height * 2, width * 2)
-    int channels = input.shape[0];
-    int in_h = input.shape[1];
-    int in_w = input.shape[2];
-    int out_h = in_h * 2;
-    int out_w = in_w * 2;
-    
-    auto output = std::make_unique<Tensor>(std::vector<int>{channels, out_h, out_w});
-    
-    for (int c = 0; c < channels; c++) {
-        for (int oh = 0; oh < out_h; oh++) {
-            for (int ow = 0; ow < out_w; ow++) {
-                // Nearest neighbor: divide by 2 to get input position
-                int ih = oh / 2;
-                int iw = ow / 2;
-                
-                int in_idx  = c * (in_h * in_w)  + ih * in_w + iw;
-                int out_idx = c * (out_h * out_w) + oh * out_w + ow;
-                
-                output->data[out_idx] = input.data[in_idx];
-            }
-        }
-    }
-    
-    return output;
+    return out;
 }
 
-std::unique_ptr<Tensor> concat(const std::vector<const Tensor*>& tensors) {
-    // All tensors must have same height and width, we concat along channel dim
+float iou(const Detection& a, const Detection& b) {
+    const float ix1 = std::max(a.x1, b.x1);
+    const float iy1 = std::max(a.y1, b.y1);
+    const float ix2 = std::min(a.x2, b.x2);
+    const float iy2 = std::min(a.y2, b.y2);
+
+    const float iw = std::max(0.0f, ix2 - ix1);
+    const float ih = std::max(0.0f, iy2 - iy1);
+    const float inter = iw * ih;
+    if (inter <= 0.0f) return 0.0f;
+
+    const float area_a = std::max(0.0f, a.x2 - a.x1) * std::max(0.0f, a.y2 - a.y1);
+    const float area_b = std::max(0.0f, b.x2 - b.x1) * std::max(0.0f, b.y2 - b.y1);
+    const float uni = area_a + area_b - inter;
+    return uni > 0.0f ? inter / uni : 0.0f;
+}
+
+}  // namespace
+
+std::unique_ptr<Tensor> conv2d_quant(const Tensor& input,
+                                     const Layer& layer,
+                                     float out_scale,
+                                     int out_zp,
+                                     bool apply_silu,
+                                     const Tensor* residual) {
+    FloatTensor real = conv2d_real(input, layer, apply_silu);
+
+    auto out = std::make_unique<Tensor>(real.shape, out_scale, out_zp);
+
+    if (residual != nullptr) {
+        if (residual->num_elements != out->num_elements) {
+            throw std::runtime_error("Residual shape mismatch at " + layer.path);
+        }
+        // Add in the real domain so the two tensors' scales need not agree,
+        // then quantize once.
+        for (size_t i = 0; i < out->num_elements; i++) {
+            out->data[i] = quantize_one(real.data[i] + residual->real_at(i), out_scale, out_zp);
+        }
+    } else {
+        for (size_t i = 0; i < out->num_elements; i++) {
+            out->data[i] = quantize_one(real.data[i], out_scale, out_zp);
+        }
+    }
+
+    return out;
+}
+
+FloatTensor conv2d_float(const Tensor& input, const Layer& layer, bool apply_silu) {
+    return conv2d_real(input, layer, apply_silu);
+}
+
+std::unique_ptr<Tensor> requantize(const Tensor& input, float scale, int zero_point) {
+    auto out = std::make_unique<Tensor>(input.shape, scale, zero_point);
+
+    if (input.scale == scale && input.zero_point == zero_point) {
+        std::memcpy(out->data, input.data, input.num_elements);
+        return out;
+    }
+
+    for (size_t i = 0; i < input.num_elements; i++) {
+        out->data[i] = quantize_one(input.real_at(i), scale, zero_point);
+    }
+    return out;
+}
+
+std::unique_ptr<Tensor> concat(const std::vector<const Tensor*>& tensors,
+                               float scale,
+                               int zero_point) {
     if (tensors.empty()) {
         throw std::runtime_error("Concat needs at least one tensor");
     }
-    
-    // Verify all tensors have the same spatial shape
-    int height = tensors[0]->shape[1];
-    int width  = tensors[0]->shape[2];
+
+    const int height = tensors[0]->shape[1];
+    const int width = tensors[0]->shape[2];
     int total_channels = 0;
     for (const Tensor* t : tensors) {
         if (t->shape[1] != height || t->shape[2] != width) {
@@ -153,262 +172,328 @@ std::unique_ptr<Tensor> concat(const std::vector<const Tensor*>& tensors) {
         }
         total_channels += t->shape[0];
     }
-    
-    auto output = std::make_unique<Tensor>(std::vector<int>{total_channels, height, width});
-    
-    // Copy each input tensor's data into the output at the right channel offset
-    int channel_offset = 0;
+
+    auto out = std::make_unique<Tensor>(std::vector<int>{total_channels, height, width},
+                                        scale, zero_point);
+
+    const size_t plane = static_cast<size_t>(height) * width;
+    size_t offset = 0;
     for (const Tensor* t : tensors) {
-        int t_channels = t->shape[0];
-        size_t bytes_per_channel = height * width;  // INT8 = 1 byte per element
-        
-        for (int c = 0; c < t_channels; c++) {
-            const int8_t* src = t->data + c * bytes_per_channel;
-            int8_t* dst = output->data + (channel_offset + c) * bytes_per_channel;
-            std::memcpy(dst, src, bytes_per_channel);
-        }
-        
-        channel_offset += t_channels;
-    }
-    
-    return output;
-}
-std::unique_ptr<Tensor> maxpool2d(const Tensor& input, int kernel_size) {
-    // Input shape: (channels, height, width)
-    // Output shape: same as input (stride=1, padding = kernel_size/2)
-    int channels = input.shape[0];
-    int height = input.shape[1];
-    int width = input.shape[2];
-    int padding = kernel_size / 2;  // integer division; for kernel=5, padding=2
-    
-    auto output = std::make_unique<Tensor>(std::vector<int>{channels, height, width});
-    
-    for (int c = 0; c < channels; c++) {
-        for (int oh = 0; oh < height; oh++) {
-            for (int ow = 0; ow < width; ow++) {
-                // Find max in the kernel_size x kernel_size window centered at (oh, ow)
-                int8_t max_val = -128;  // INT8 minimum, so anything real beats this
-                
-                for (int kh = 0; kh < kernel_size; kh++) {
-                    for (int kw = 0; kw < kernel_size; kw++) {
-                        int ih = oh + kh - padding;
-                        int iw = ow + kw - padding;
-                        
-                        // Skip positions outside the input
-                        if (ih < 0 || ih >= height || iw < 0 || iw >= width) {
-                            continue;
-                        }
-                        
-                        int in_idx = c * (height * width) + ih * width + iw;
-                        if (input.data[in_idx] > max_val) {
-                            max_val = input.data[in_idx];
-                        }
-                    }
-                }
-                
-                int out_idx = c * (height * width) + oh * width + ow;
-                output->data[out_idx] = max_val;
+        const size_t n = static_cast<size_t>(t->shape[0]) * plane;
+        if (t->scale == scale && t->zero_point == zero_point) {
+            std::memcpy(out->data + offset, t->data, n);
+        } else {
+            for (size_t i = 0; i < n; i++) {
+                out->data[offset + i] = quantize_one(t->real_at(i), scale, zero_point);
             }
         }
+        offset += n;
     }
-    
-    return output;
-}
-std::unique_ptr<Tensor> bottleneck(
-    const Tensor& input,
-    const Layer& conv1, float input_scale, int input_zp, float mid_scale, int mid_zp,
-    const Layer& conv2, float out_scale, int out_zp,
-    bool shortcut
-) {
-    auto x = conv2d(input, *conv1.weights, 1, 1,
-                    input_scale, conv1.weight_scale, mid_scale, mid_zp);
-    silu_inplace(*x, mid_scale, mid_zp, mid_scale, mid_zp);
-    
-    auto y = conv2d(*x, *conv2.weights, 1, 1,
-                    mid_scale, conv2.weight_scale, out_scale, out_zp);
-    silu_inplace(*y, out_scale, out_zp, out_scale, out_zp);
-    
-    if (shortcut) {
-        for (size_t i = 0; i < y->num_elements; i++) {
-            int32_t sum = (int32_t)y->data[i] + (int32_t)input.data[i];
-            if (sum > 127) sum = 127;
-            if (sum < -128) sum = -128;
-            y->data[i] = (int8_t)sum;
-        }
-    }
-    return y;
-}
-std::unique_ptr<Tensor> c2f_block(
-    const Tensor& input,
-    const std::vector<const Layer*>& convs,
-    const std::vector<float>& scales,
-    const std::vector<int>& zero_points,
-    int n_bottlenecks,
-    bool shortcut
-) {
-    float in_s = scales[0];
-    float out_s = scales[1];
-    int out_z = zero_points[1];
-    
-    // conv[0] is cv1, conv[1] is cv2 (final output conv)
-    // convs[2..] are the bottleneck convs, 2 per bottleneck
-    
-    auto x = conv2d(input, *convs[0]->weights, 1, 0,
-                    in_s, convs[0]->weight_scale, out_s, out_z);
-    silu_inplace(*x, out_s, out_z, out_s, out_z);
-    
-    int channels = x->shape[0];
-    int half_channels = channels / 2;
-    int height = x->shape[1];
-    int width = x->shape[2];
-    
-    Tensor a({half_channels, height, width});
-    Tensor b({half_channels, height, width});
-    size_t half_bytes = half_channels * height * width;
-    std::memcpy(a.data, x->data, half_bytes);
-    std::memcpy(b.data, x->data + half_bytes, half_bytes);
-    
-    std::vector<std::unique_ptr<Tensor>> owned_tensors;
-    std::vector<const Tensor*> concat_inputs;
-    concat_inputs.push_back(&a);
-    concat_inputs.push_back(&b);
-    
-    const Tensor* current = &b;
-    for (int i = 0; i < n_bottlenecks; i++) {
-        // Bottleneck convs start at index 2, two per bottleneck
-        int c1_idx = 2 + i * 2;
-        int c2_idx = 3 + i * 2;
-        
-        auto next = bottleneck(*current,
-                               *convs[c1_idx], out_s, out_z, out_s, out_z,
-                               *convs[c2_idx], out_s, out_z,
-                               shortcut);
-        current = next.get();
-        concat_inputs.push_back(current);
-        owned_tensors.push_back(std::move(next));
-    }
-    
-    auto concat_out = concat(concat_inputs);
-    
-    // Final conv is conv[1] (cv2)
-    auto result = conv2d(*concat_out, *convs[1]->weights, 1, 0,
-                         out_s, convs[1]->weight_scale, out_s, out_z);
-    silu_inplace(*result, out_s, out_z, out_s, out_z);
-    return result;
-}
 
-std::unique_ptr<Tensor> sppf_block(
-    const Tensor& input,
-    const Layer& cv1, float input_scale, int input_zp, float mid_scale, int mid_zp,
-    const Layer& cv2, float out_scale, int out_zp,
-    int kernel_size
-) {
-    auto x = conv2d(input, *cv1.weights, 1, 0,
-                    input_scale, cv1.weight_scale, mid_scale, mid_zp);
-    silu_inplace(*x, mid_scale, mid_zp, mid_scale, mid_zp);
-    
-    auto y1 = maxpool2d(*x, kernel_size);
-    auto y2 = maxpool2d(*y1, kernel_size);
-    auto y3 = maxpool2d(*y2, kernel_size);
-    
-    std::vector<const Tensor*> to_concat = {x.get(), y1.get(), y2.get(), y3.get()};
-    auto merged = concat(to_concat);
-    
-    auto result = conv2d(*merged, *cv2.weights, 1, 0,
-                         mid_scale, cv2.weight_scale, out_scale, out_zp);
-    silu_inplace(*result, out_scale, out_zp, out_scale, out_zp);
-    return result;
-}
-std::unique_ptr<Tensor> conv_block(
-    const Tensor& input,
-    const Layer& conv,
-    int stride,
-    int padding,
-    float input_scale,
-    float output_scale,
-    int output_zp
-) {
-    auto out = conv2d(input, *conv.weights, stride, padding,
-                      input_scale, conv.weight_scale, output_scale, output_zp);
-    silu_inplace(*out, output_scale, output_zp, output_scale, output_zp);
     return out;
 }
 
-std::vector<std::unique_ptr<Tensor>> run_forward(const Model& model, const Tensor& input) {
-    std::vector<std::unique_ptr<Tensor>> outputs;
-    outputs.resize(model.architecture.size());
-    
-    float input_scale = 1.0f / 255.0f;
-    
+std::unique_ptr<Tensor> upsample2x(const Tensor& input) {
+    const int channels = input.shape[0];
+    const int in_h = input.shape[1];
+    const int in_w = input.shape[2];
+    const int out_h = in_h * 2;
+    const int out_w = in_w * 2;
+
+    // Nearest-neighbour copies values verbatim, so the quantization parameters
+    // carry through unchanged.
+    auto out = std::make_unique<Tensor>(std::vector<int>{channels, out_h, out_w},
+                                        input.scale, input.zero_point);
+
+    for (int c = 0; c < channels; c++) {
+        for (int oh = 0; oh < out_h; oh++) {
+            const int ih = oh / 2;
+            for (int ow = 0; ow < out_w; ow++) {
+                const int iw = ow / 2;
+                out->data[(static_cast<size_t>(c) * out_h + oh) * out_w + ow] =
+                    input.data[(static_cast<size_t>(c) * in_h + ih) * in_w + iw];
+            }
+        }
+    }
+
+    return out;
+}
+
+std::unique_ptr<Tensor> maxpool2d(const Tensor& input, int kernel_size) {
+    const int channels = input.shape[0];
+    const int height = input.shape[1];
+    const int width = input.shape[2];
+    const int pad = kernel_size / 2;
+
+    // Max is monotonic, so the output lives on the input's scale.
+    auto out = std::make_unique<Tensor>(std::vector<int>{channels, height, width},
+                                        input.scale, input.zero_point);
+
+    for (int c = 0; c < channels; c++) {
+        const int8_t* in_c = input.data + static_cast<size_t>(c) * height * width;
+        int8_t* out_c = out->data + static_cast<size_t>(c) * height * width;
+
+        for (int oh = 0; oh < height; oh++) {
+            for (int ow = 0; ow < width; ow++) {
+                // PyTorch pads MaxPool with -inf, so out-of-bounds positions are
+                // skipped rather than treated as zero.
+                int8_t best = -128;
+                bool seen = false;
+
+                for (int r = 0; r < kernel_size; r++) {
+                    const int ih = oh + r - pad;
+                    if (ih < 0 || ih >= height) continue;
+                    for (int c2 = 0; c2 < kernel_size; c2++) {
+                        const int iw = ow + c2 - pad;
+                        if (iw < 0 || iw >= width) continue;
+                        const int8_t v = in_c[ih * width + iw];
+                        if (!seen || v > best) {
+                            best = v;
+                            seen = true;
+                        }
+                    }
+                }
+                out_c[oh * width + ow] = best;
+            }
+        }
+    }
+
+    return out;
+}
+
+std::unique_ptr<Tensor> c2f_block(const Tensor& input, const Model& model,
+                                  const ArchLayer& arch) {
+    const Layer& cv1 = model.conv_layers[arch.cv1];
+    const Layer& cv2 = model.conv_layers[arch.cv2];
+
+    // cv1 produces 2c channels which are split in half.
+    auto y = conv2d_quant(input, cv1, cv1.out_scale, cv1.out_zero_point, cv1.silu);
+
+    const int channels = y->shape[0];
+    const int half = channels / 2;
+    const int height = y->shape[1];
+    const int width = y->shape[2];
+    const size_t half_bytes = static_cast<size_t>(half) * height * width;
+
+    // Every branch is put on one common scale -- the calibrated range of the
+    // tensor that actually feeds cv2 -- before being concatenated.
+    const float cs = arch.concat_scale;
+    const int czp = arch.concat_zero_point;
+
+    Tensor a({half, height, width}, y->scale, y->zero_point);
+    Tensor b({half, height, width}, y->scale, y->zero_point);
+    std::memcpy(a.data, y->data, half_bytes);
+    std::memcpy(b.data, y->data + half_bytes, half_bytes);
+
+    auto a_rq = requantize(a, cs, czp);
+    auto b_rq = requantize(b, cs, czp);
+
+    std::vector<std::unique_ptr<Tensor>> owned;
+    std::vector<const Tensor*> parts{a_rq.get(), b_rq.get()};
+
+    const Tensor* current = b_rq.get();
+    for (const BottleneckSpec& spec : arch.bottlenecks) {
+        const Layer& bcv1 = model.conv_layers[spec.cv1];
+        const Layer& bcv2 = model.conv_layers[spec.cv2];
+
+        auto hidden = conv2d_quant(*current, bcv1, bcv1.out_scale, bcv1.out_zero_point,
+                                   bcv1.silu);
+        // YOLOv8's Bottleneck is x + cv2(cv1(x)), so the skip is added after
+        // cv2's activation. Quantize straight onto the concat scale: the
+        // calibration for that tensor already covers these outputs.
+        auto next = conv2d_quant(*hidden, bcv2, cs, czp, bcv2.silu,
+                                 spec.shortcut ? current : nullptr);
+
+        current = next.get();
+        parts.push_back(current);
+        owned.push_back(std::move(next));
+    }
+
+    auto merged = concat(parts, cs, czp);
+    return conv2d_quant(*merged, cv2, cv2.out_scale, cv2.out_zero_point, cv2.silu);
+}
+
+std::unique_ptr<Tensor> sppf_block(const Tensor& input, const Model& model,
+                                   const ArchLayer& arch) {
+    const Layer& cv1 = model.conv_layers[arch.cv1];
+    const Layer& cv2 = model.conv_layers[arch.cv2];
+
+    auto x = conv2d_quant(input, cv1, cv1.out_scale, cv1.out_zero_point, cv1.silu);
+
+    auto y1 = maxpool2d(*x, arch.k);
+    auto y2 = maxpool2d(*y1, arch.k);
+    auto y3 = maxpool2d(*y2, arch.k);
+
+    // MaxPool preserves the scale, so all four branches already agree and the
+    // concat is exact.
+    std::vector<const Tensor*> parts{x.get(), y1.get(), y2.get(), y3.get()};
+    auto merged = concat(parts, x->scale, x->zero_point);
+
+    return conv2d_quant(*merged, cv2, cv2.out_scale, cv2.out_zero_point, cv2.silu);
+}
+
+std::vector<std::unique_ptr<Tensor>> run_backbone(const Model& model, const Tensor& input) {
+    std::vector<std::unique_ptr<Tensor>> outputs(model.architecture.size());
+
     for (size_t i = 0; i < model.architecture.size(); i++) {
-        const auto& arch = model.architecture[i];
-        
-        float out_scale = model.activation_scales.count(arch.layer_id)
-            ? model.activation_scales.at(arch.layer_id).scale : 1.0f;
-        int out_zp = model.activation_scales.count(arch.layer_id)
-            ? model.activation_scales.at(arch.layer_id).zero_point : 0;
-        
+        const ArchLayer& arch = model.architecture[i];
+
+        if (arch.type == "Detect") continue;  // handled by detect_head()
+
         const Tensor* in_tensor = nullptr;
-        float in_scale = input_scale;
-        
-        if (!arch.is_multi_input) {
-            if (arch.input_from_single == -1) {
-                in_tensor = &input;
-                in_scale = input_scale;
-            } else {
-                in_tensor = outputs[arch.input_from_single].get();
-                in_scale = model.activation_scales.count(arch.input_from_single)
-                    ? model.activation_scales.at(arch.input_from_single).scale : 1.0f;
-            }
+        if (arch.input_is_raw) {
+            in_tensor = &input;
+        } else if (!arch.inputs.empty()) {
+            in_tensor = outputs[arch.inputs[0]].get();
         }
-        
+
         std::unique_ptr<Tensor> result;
-        
+
         if (arch.type == "Conv") {
-            int stride = (arch.layer_id == 0 || arch.layer_id == 1 ||
-                          arch.layer_id == 3 || arch.layer_id == 5 ||
-                          arch.layer_id == 7 || arch.layer_id == 16 ||
-                          arch.layer_id == 19) ? 2 : 1;
-            int padding = 1;
-            const Layer& conv = model.conv_layers[arch.conv_ids[0]];
-            result = conv_block(*in_tensor, conv, stride, padding,
-                                in_scale, out_scale, out_zp);
-        }
-        else if (arch.type == "C2f") {
-            std::vector<const Layer*> convs;
-            for (int cid : arch.conv_ids) convs.push_back(&model.conv_layers[cid]);
-            std::vector<float> scales = {in_scale, out_scale};
-            std::vector<int> zps = {0, out_zp};
-            result = c2f_block(*in_tensor, convs, scales, zps,
-                               arch.n_bottlenecks, arch.shortcut);
-        }
-        else if (arch.type == "SPPF") {
-            const Layer& cv1 = model.conv_layers[arch.conv_ids[0]];
-            const Layer& cv2 = model.conv_layers[arch.conv_ids[1]];
-            result = sppf_block(*in_tensor, cv1, in_scale, 0, out_scale, out_zp,
-                                cv2, out_scale, out_zp, arch.kernel_size);
-        }
-        else if (arch.type == "Upsample") {
+            const Layer& conv = model.conv_layers[arch.conv];
+            result = conv2d_quant(*in_tensor, conv, conv.out_scale, conv.out_zero_point,
+                                  conv.silu);
+        } else if (arch.type == "C2f") {
+            result = c2f_block(*in_tensor, model, arch);
+        } else if (arch.type == "SPPF") {
+            result = sppf_block(*in_tensor, model, arch);
+        } else if (arch.type == "Upsample") {
             result = upsample2x(*in_tensor);
-        }
-        else if (arch.type == "Concat") {
-            std::vector<const Tensor*> to_concat;
-            for (int layer_idx : arch.input_from_multi) {
-                to_concat.push_back(outputs[layer_idx].get());
+        } else if (arch.type == "Concat") {
+            std::vector<const Tensor*> parts;
+            for (int idx : arch.inputs) {
+                parts.push_back(outputs[idx].get());
             }
-            result = concat(to_concat);
+            result = concat(parts, arch.out_scale, arch.out_zero_point);
+        } else {
+            throw std::runtime_error("Unhandled layer type: " + arch.type);
         }
-       else if (arch.type == "Detect") {
-            // Return the deepest feature map (from layer 21) as final output
-            // In production, this would feed into box decoding + NMS
-            int last_source = arch.input_from_multi.back();
-            result = std::make_unique<Tensor>(outputs[last_source]->shape);
-            std::memcpy(result->data, outputs[last_source]->data,
-                        outputs[last_source]->num_elements);
-        }
-        
+
         outputs[i] = std::move(result);
     }
-    
+
     return outputs;
+}
+
+std::vector<Detection> detect_head(const Model& model,
+                                   const std::vector<std::unique_ptr<Tensor>>& features,
+                                   float conf_threshold,
+                                   float iou_threshold) {
+    const ArchLayer* det = nullptr;
+    for (const ArchLayer& a : model.architecture) {
+        if (a.type == "Detect") det = &a;
+    }
+    if (det == nullptr) throw std::runtime_error("No Detect layer in the model");
+
+    const int reg_max = det->reg_max;
+    const int nc = det->nc;
+
+    std::vector<Detection> candidates;
+
+    for (size_t level = 0; level < det->inputs.size(); level++) {
+        const Tensor& feat = *features[det->inputs[level]];
+        const float stride = det->strides[level];
+
+        // Box branch: two 3x3 Convs (INT8) then a 1x1 predictor kept in FP32.
+        const Layer& b0 = model.conv_layers[det->det_cv2[level][0]];
+        const Layer& b1 = model.conv_layers[det->det_cv2[level][1]];
+        const Layer& b2 = model.conv_layers[det->det_cv2[level][2]];
+        auto bh0 = conv2d_quant(feat, b0, b0.out_scale, b0.out_zero_point, b0.silu);
+        auto bh1 = conv2d_quant(*bh0, b1, b1.out_scale, b1.out_zero_point, b1.silu);
+        FloatTensor box = conv2d_float(*bh1, b2, false);
+
+        // Class branch.
+        const Layer& c0 = model.conv_layers[det->det_cv3[level][0]];
+        const Layer& c1 = model.conv_layers[det->det_cv3[level][1]];
+        const Layer& c2 = model.conv_layers[det->det_cv3[level][2]];
+        auto ch0 = conv2d_quant(feat, c0, c0.out_scale, c0.out_zero_point, c0.silu);
+        auto ch1 = conv2d_quant(*ch0, c1, c1.out_scale, c1.out_zero_point, c1.silu);
+        FloatTensor cls = conv2d_float(*ch1, c2, false);
+
+        const int h = box.shape[1];
+        const int w = box.shape[2];
+        const size_t plane = static_cast<size_t>(h) * w;
+
+        std::vector<float> prob(reg_max);
+
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                const size_t pos = static_cast<size_t>(y) * w + x;
+
+                // Best class at this anchor.
+                int best_cls = 0;
+                float best_logit = -1e30f;
+                for (int k = 0; k < nc; k++) {
+                    const float v = cls.data[static_cast<size_t>(k) * plane + pos];
+                    if (v > best_logit) {
+                        best_logit = v;
+                        best_cls = k;
+                    }
+                }
+                const float score = 1.0f / (1.0f + std::exp(-best_logit));
+                if (score < conf_threshold) continue;
+
+                // DFL: each of the 4 box sides is a distribution over reg_max
+                // bins; its expected value is the distance to that edge, in
+                // stride units.
+                float dist[4];
+                for (int side = 0; side < 4; side++) {
+                    float max_logit = -1e30f;
+                    for (int j = 0; j < reg_max; j++) {
+                        const float v =
+                            box.data[static_cast<size_t>(side * reg_max + j) * plane + pos];
+                        prob[j] = v;
+                        if (v > max_logit) max_logit = v;
+                    }
+                    float sum = 0.0f;
+                    for (int j = 0; j < reg_max; j++) {
+                        prob[j] = std::exp(prob[j] - max_logit);
+                        sum += prob[j];
+                    }
+                    float expectation = 0.0f;
+                    for (int j = 0; j < reg_max; j++) {
+                        expectation += static_cast<float>(j) * prob[j];
+                    }
+                    dist[side] = expectation / sum;
+                }
+
+                // Anchor centre sits at the middle of the cell.
+                const float ax = static_cast<float>(x) + 0.5f;
+                const float ay = static_cast<float>(y) + 0.5f;
+
+                Detection d;
+                d.x1 = (ax - dist[0]) * stride;
+                d.y1 = (ay - dist[1]) * stride;
+                d.x2 = (ax + dist[2]) * stride;
+                d.y2 = (ay + dist[3]) * stride;
+                d.score = score;
+                d.cls = best_cls;
+                candidates.push_back(d);
+            }
+        }
+    }
+
+    // Greedy per-class NMS.
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Detection& a, const Detection& b) { return a.score > b.score; });
+
+    std::vector<Detection> kept;
+    std::vector<bool> suppressed(candidates.size(), false);
+    for (size_t i = 0; i < candidates.size(); i++) {
+        if (suppressed[i]) continue;
+        kept.push_back(candidates[i]);
+        for (size_t j = i + 1; j < candidates.size(); j++) {
+            if (suppressed[j]) continue;
+            if (candidates[j].cls != candidates[i].cls) continue;
+            if (iou(candidates[i], candidates[j]) > iou_threshold) suppressed[j] = true;
+        }
+    }
+
+    return kept;
+}
+
+std::vector<Detection> run_inference(const Model& model, const Tensor& input,
+                                     float conf_threshold, float iou_threshold) {
+    auto features = run_backbone(model, input);
+    return detect_head(model, features, conf_threshold, iou_threshold);
 }

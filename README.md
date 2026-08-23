@@ -1,108 +1,117 @@
 # Custom AI Hardware Inference
 
-A from-scratch inference and quantization pipeline for a YOLOv8n fire and smoke detection model. Instead of treating quantization and inference as black-box library calls, this project implements the underlying math from scratch, then benchmarks the result against production runtimes.
+A fire and smoke detector that runs on hand written C++ instead of a machine learning library.
 
-The goal is to understand what production inference systems do internally by building a smaller version by hand.
+The starting point is a YOLOv8n model trained to find fire and smoke in photos. Normally you would run it with PyTorch or ONNX Runtime, which does all the math for you. This project rebuilds that stack from scratch to understand what those libraries are actually doing. First it shrinks the model so it uses 8 bit whole numbers instead of 32 bit decimals, with the conversion math written from first principles rather than by calling a library function. Then it implements the engine that runs the model, including the convolutions, the activation functions, the compound blocks YOLOv8 is built from, the detection head, box decoding and duplicate removal.
 
-## Status
+Give it a photo and it draws boxes around the fire and smoke it finds.
 
-- [x] **M1: FP32 baseline** — trained YOLOv8n on the fire-8 dataset, benchmarked across four production runtimes
-- [x] **M2: From-scratch INT8 quantization** — implemented affine quantization, quantized matmul, and activation calibration end-to-end. Preserved 91% of FP32 mAP@0.5.
-- [x] **M3: Custom C++ inference engine** — hand-written engine that loads the quantized model and runs full YOLOv8n inference end-to-end. Conv2d operator validated bit-level against PyTorch reference; end-to-end drift documented below.
+```bash
+./custom_engine fire.jpg      # writes fire_pred.jpg
+```
 
-## Model
+```
+Loaded fire.jpg (640x640)
+Inference: 3516.4 ms
+Detections: 1
+  fire   0.733  box=[328.4, 179.6, 528.3, 581.4]
+```
 
-YOLOv8n fine-tuned on the fire-8 dataset (2 classes: fire, smoke). Trained for 50 epochs on a Tesla T4 in Google Colab.
+| | |
+|---|---|
+| ![fire detected at 73 percent](docs/examples/fire.jpg) | ![smoke detected at 90 percent](docs/examples/smoke.jpg) |
 
-- Parameters: 3.0M
-- Model size (FP32): 6.0 MB
-- Model size (INT8): 2.9 MB (~4× compression)
+Red for fire, blue for smoke, with the class and confidence drawn on the box. Both of these came out of the engine as shown, no post processing.
+
+## Milestones
+
+**M1, full precision baseline.** Trained YOLOv8n on the fire-8 dataset, 3.0M parameters over two classes, 50 epochs on a Tesla T4. Benchmarked across four production runtimes to establish what the model does and how fast the alternatives are.
+
+**M2, 8 bit quantization written from scratch.** Rather than calling `torch.quantization`, this implements the underlying math directly.
+
+- Converting weights to 8 bit, both per-tensor and per-channel
+- Measuring the range of every activation in the network by running calibration images through it and recording what actually flows through each layer
+- Folding BatchNorm into the convolution so it costs nothing at runtime
+- Integer accumulation with the requantization arithmetic that converts back to real values
+
+**M3, the C++ engine.** Loads the quantized model and runs it end to end.
+
+- A tensor type that carries its own scale and offset, so operations cannot silently combine numbers that mean different things
+- A loader for a custom binary and JSON model format
+- Quantized convolution with 32 bit accumulation and folded BatchNorm
+- Activation functions, upscaling, pooling and feature map merging
+- The compound blocks YOLOv8 is built from, Bottleneck, C2f and SPPF
+- The detection head, including the distribution based box decoding and removal of overlapping boxes
+- JPEG in, annotated JPEG out
+
+**M4, hardware accelerator.** An FPGA implementation in Verilog. Planned.
 
 ## Results
 
-### Accuracy
+The engine keeps **99.6% of the original model's accuracy**. The metric is mAP@0.5, a standard detection score where higher is better and 1.0 is perfect. Every row was produced by the same scoring code over the same 49 test images, so they compare directly.
 
-| Configuration | mAP@0.5 | Drop from FP32 |
-|---------------|---------|----------------|
-| FP32 baseline | 0.9253 | — |
-| INT8 weights (symmetric per-tensor) | 0.8467 | -8.5% |
-| INT8 weights + activations (asymmetric per-tensor) | 0.8445 | -8.7% |
+| Configuration | mAP@0.5 | vs full precision |
+|---|---|---|
+| Original 32 bit model | 0.8859 | reference |
+| **This engine, per-channel weights** | **0.8826** | **99.6%** |
+| This engine, per-tensor weights | 0.7680 | 86.7% |
 
-From-scratch quantization preserves 91% of the FP32 mAP@0.5.
+Per-channel weights are what close most of the gap. Per-tensor gives a whole layer one shared scale, while per-channel gives each output channel its own. Since the filters within a layer can differ in magnitude by more than a factor of ten, a shared scale is set by the loudest filter and forces the quietest ones into a handful of the 256 available steps. Per-channel costs four bytes per output channel of metadata and nothing at runtime, because the multiplier that converts the accumulator back to real values is already per-channel.
 
-### Latency
+For reference, the same model converted to 8 bit by production libraries scores 0.8556 with ONNX Runtime and 0.8089 with OpenVINO.
 
-Comparison of full inference on the same 640×640 image:
+## Speed
 
-| Runtime | Hardware | Precision | Latency |
-|---------|----------|-----------|---------|
-| PyTorch (Ultralytics) | Intel Core Ultra 7 256V | FP32 | 46 ms |
-| ONNX Runtime | Intel Core Ultra 7 256V | FP32 | 40 ms |
-| OpenVINO | Intel Core Ultra 7 256V | FP32 | 31 ms |
-| TensorRT | NVIDIA T4 (Colab) | FP16 | 12 ms |
-| Custom C++ engine | Intel Core Ultra 7 256V | INT8 | 3145 ms |
+The honest weak point and the current focus. The engine was written for correctness first, with no vectorization, no threading and no cache blocking.
 
-Production runtimes are significantly faster because they use hardware-specific optimizations that my hand-written naive C++ does not. Closing this gap would require techniques like multi-threading and vectorization.
+| Runtime | Precision | Best latency |
+|---|---|---|
+| PyTorch, laptop CPU | FP32 | 42.4 ms |
+| ONNX Runtime, laptop CPU | FP32 | 24.1 ms |
+| OpenVINO, laptop CPU | INT8 | 13.9 ms |
+| TensorRT, Tesla T4 | INT8 | 4.9 ms |
+| This engine, laptop CPU | INT8 | 3516 ms |
 
-The custom C++ engine performs a full quantized forward pass but accumulates numerical drift end-to-end; see the following section for details.
+All CPU measurements were taken in one session on mains power, one runtime per process with a settle gap between them, reporting the fastest of 120 samples. Sharing a process between runtimes inflated the numbers by an order of magnitude before that was corrected.
 
-### End-to-End Numerical Accuracy
+## What is actually 8 bit
 
-The C++ engine was validated at two levels: per-operator and end-to-end.
+Worth stating precisely, since the phrase can mean different things.
 
-**Per-operator (Layer 0 conv2d)** was compared bit-level against a PyTorch reference across 1.6M output values: 84.0% exact matches, 98.1% within ±1. This confirms the conv2d operator itself is numerically correct.
+The weights are 8 bit, stored and loaded as raw bytes and never converted to floating point. The activations passed between every layer are 8 bit. The convolution is a genuine integer multiply accumulate into a 32 bit accumulator, which is the operation that maps onto a single SIMD instruction and onto hardware later.
 
-**End-to-end** was measured by dumping intermediate activations at every network layer and comparing against the fake-quantized Python reference on the same test image:
+The conversion between layers is floating point, and so is the detection head. The head is deliberate. Box coordinates run from 0 to 640 while confidence scores run from 0 to 1, and a single 8 bit scale cannot represent both, so decoding stays in full precision.
 
-| Layer | % Within ±1 | MAE |
-|-------|-------------|-----|
-| L00 (first conv) | 38.3% | 9.0 |
-| L01 (second conv) | 33.6% | 6.6 |
-| L02 (first C2f) | 10.2% | 80.2 |
-| L15 (P3 output) | 17.6% | 15.3 |
-| L18 (P4 output) | 2.8% | 83.8 |
-| L21 (P5 output) | 1.1% | 132.4 |
+## What is next
 
-Drift grows sharply at layers containing C2f blocks. Two design decisions cause this:
+Writing CUDA GEMM kernels to make the engine fast on a GPU.
 
-1. **Concat scale mixing.** YOLOv8n uses concat operations to merge feature maps at different points in the network. Each input to a concat is a quantized tensor at its own scale. The engine concatenates raw INT8 bytes without requantizing to a common scale — a production runtime like TensorRT inserts a requantization step here.
-2. **Per-module activation calibration.** Activation scales are calibrated at the output of each of the 22 top-level modules, not at every internal conv inside C2f and SPPF blocks. Internal convs use the block's output scale as an approximation. Per-conv calibration was attempted and did not materially reduce drift — Concat scale-mixing is the dominant source.
+The current engine is a correctness first implementation, six nested loops with no vectorization, no threading and no cache blocking. It gets through 1.15 billion multiply accumulates per second against the 4.04 billion the model needs per image. The plan is to restructure the convolution as a matrix multiply and write the kernels for it, which is how real engines get their speed.
 
-The engine is intended as a portfolio piece to demonstrate the mechanics of quantized inference from first principles; closing this drift would require implementing common-scale requantization at every concat boundary.
+Accuracy is protected while that happens. Layer by layer comparison against PyTorch plus end to end scoring over the test set means any kernel that breaks correctness shows up immediately rather than several stages later.
 
-## Approach
+## Reproducing
 
-**M2 (Quantization)** implements post-training static quantization from first principles rather than calling `torch.quantization`:
+```bash
+python quantization/calibrate.py                    # measure activation ranges
+python quantization/save_model.py --per-channel     # write the quantized model
+cd cpp_engine && mkdir -p build && cd build && cmake .. && make
 
-- **Weights**: symmetric per-tensor INT8, computed directly from weight min/max
-- **Activations**: asymmetric per-tensor INT8, calibrated on 100 training images using PyTorch forward hooks
-- **Matmul**: INT32 accumulation to prevent overflow, requantization scale `M = s_A × s_B / s_C` applied per output
+python quantization/compare_layers.py --dumps cpp_engine/build/dumps_pc \
+    --model quantization/model_int8_pc.json         # layer by layer check
+bash cpp_engine/run_both.sh
+python quantization/eval_map.py --csv cpp_engine/build/preds_pc/detections.csv
+python benchmarks/run_all_benchmarks.py             # compare against the libraries
+```
 
-**M3 (C++ Engine)** implements the operators needed to run YOLOv8n:
+Requires `cmake`, a C++17 compiler and `nlohmann-json`. Image handling uses [stb](https://github.com/nothings/stb), included in `cpp_engine/third_party/`.
 
-- Custom Tensor class with heap-allocated INT8 buffers
-- Model loader that reads a custom binary + JSON format
-- Quantized conv2d with INT32 accumulation and requantization
-- Activation function (SiLU) via 256-entry precomputed lookup table
-- Element-wise ops (Concat, Upsample, MaxPool)
-- Compound blocks (Bottleneck, C2f, SPPF) built from base operators
-- Forward pass runner that walks the model architecture
+## Layout
 
-## Repo Contents
-
-- `quantization/` — from-scratch INT8 quantization pipeline (Python)
-  - `quantization.py` — quantize/dequantize/quantized_matmul functions
-  - `calibrate.py` — activation calibration via forward hooks
-  - `quantized_inference.py` — end-to-end fake-quantized inference
-  - `save_model.py` — serialize the quantized model with architecture metadata
-- `cpp_engine/` — custom C++ inference engine (M3)
-  - `tensor.h/cpp` — Tensor class
-  - `model.h/cpp` — model loader
-  - `ops.h/cpp` — all operators and forward pass runner
-  - `main.cpp` — entry point and benchmarking harness
-- `benchmarks/` — M1 baselines against production runtimes
-- `Results.md` — full benchmark results and notes
+- `quantization/`, the Python side. Conversion math, calibration, BatchNorm folding, and the two validation harnesses.
+- `cpp_engine/`, the engine. Tensor type, model loader, operators, detection head, image handling.
+- `benchmarks/`, comparisons against PyTorch, ONNX Runtime, OpenVINO and TensorRT.
 
 ## Dataset
 
-[fire-8 from Abonia1](https://github.com/Abonia1/YOLOv8-Fire-and-Smoke-Detection) — 2-class fire and smoke detection dataset.
+[fire-8 from Abonia1](https://github.com/Abonia1/YOLOv8-Fire-and-Smoke-Detection), a two class fire and smoke detection dataset. The model is YOLOv8n fine tuned for 50 epochs, 3.0M parameters, 6.0 MB at full precision and 2.9 MB once converted.
