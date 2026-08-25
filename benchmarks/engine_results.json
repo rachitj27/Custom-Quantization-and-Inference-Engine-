@@ -1,21 +1,45 @@
 [
   {
-    "label": "Custom C++ engine (per-channel) INT8",
-    "min_ms": 3516.4,
-    "median_ms": 3537.1,
-    "mean_ms": 3537.1,
+    "label": "Custom C++ engine (per-channel) INT8, AVX-VNNI",
+    "kernel": "vnni-int8",
+    "min_ms": 233.5,
+    "median_ms": 238.7,
     "map50": 0.8826,
     "per_class": {
       "fire": 0.7742,
       "smoke": 0.9909
     },
-    "note": "cpp_engine/build/custom_engine --bench 6 on AC power; mAP via quantization/eval_map.py over the full test set"
+    "note": "cpp_engine/build/custom_engine --bench 3, five separate processes with a 10s settle gap, on AC power; mAP via quantization/eval_map.py over the full test set; byte-for-byte identical output to the scalar INT8 kernel, verified on all 22 layer dumps and all 49 test images"
   },
   {
-    "label": "Custom C++ engine (per-tensor) INT8",
+    "label": "Custom C++ engine (per-channel) INT8, scalar",
+    "kernel": "scalar-int8",
+    "min_ms": 3578.7,
+    "median_ms": 3776.1,
+    "map50": 0.8826,
+    "per_class": {
+      "fire": 0.7742,
+      "smoke": 0.9909
+    },
+    "note": "cpp_engine/build/custom_engine --bench 3, five separate processes with a 10s settle gap, on AC power; mAP via quantization/eval_map.py over the full test set; this is the original loop, unchanged. An earlier session measured it at 3516.4 ms, so the two agree within 2%"
+  },
+  {
+    "label": "Custom C++ engine (per-channel) FP32 arithmetic, scalar",
+    "kernel": "scalar-fp32",
+    "min_ms": 3105.9,
+    "median_ms": 3127.6,
+    "map50": 0.8836,
+    "per_class": {
+      "fire": 0.7742,
+      "smoke": 0.993
+    },
+    "note": "cpp_engine/build/custom_engine --bench 3, five separate processes with a 10s settle gap, on AC power; mAP via quantization/eval_map.py over the full test set; an arithmetic-width baseline, not a full-precision engine. It runs the same INT8 weights dequantized and still passes INT8 activations between layers, so the mAP is not an FP32 reference. A true FP32 model scores 0.8859"
+  },
+  {
+    "label": "Custom C++ engine (per-tensor) INT8, scalar",
+    "kernel": "scalar-int8",
     "min_ms": 3418.1,
     "median_ms": 3461.4,
-    "mean_ms": 3461.4,
     "map50": 0.768,
     "per_class": {
       "fire": 0.5935,
