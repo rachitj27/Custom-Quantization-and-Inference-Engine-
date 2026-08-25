@@ -36,9 +36,8 @@ Red for fire, blue for smoke, with the class and confidence drawn on the box. Bo
 
 **M3, the C++ engine.** Loads the quantized model and runs it end to end.
 
-- A tensor type that carries its own scale and offset, so operations cannot silently combine numbers that mean different things
-- A loader for a custom binary and JSON model format
-- Quantized convolution with 32 bit accumulation and folded BatchNorm
+- A tensor type that carries its own scale and offset
+- Quantized convolution with 32 bit accumulation
 - A vectorized version of that convolution built on the processor's 8 bit dot product instruction, fifteen times faster than the plain loop and byte for byte identical in what it produces
 - Activation functions, upscaling, pooling and feature map merging
 - The compound blocks YOLOv8 is built from, Bottleneck, C2f and SPPF
