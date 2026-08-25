@@ -68,6 +68,11 @@ The vectorized kernel described below scores exactly the same 0.8826, because it
 
 The engine runs three convolution kernels, picked with `--kernel`. They compute the same thing and differ only in how the arithmetic is issued.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/speedup-dark.png">
+  <img alt="Two bar charts. The first shows the engine's three kernels, where the vectorized 8 bit kernel takes 234 milliseconds against 3579 for the plain 8 bit loop and 3106 for the plain 32 bit loop, a 15x gain. The second places the engine against production runtimes on a log scale, where OpenVINO in 8 bit takes 13.9 milliseconds, ONNX Runtime in 32 bit takes 24.1 and PyTorch in 32 bit takes 42.4." src="docs/speedup-light.png">
+</picture>
+
 | Kernel | What it does | Best latency | mAP@0.5 |
 |---|---|---|---|
 | `scalar-fp32` | the plain loop in 32 bit decimals | 3106 ms | 0.8836 |
@@ -135,6 +140,7 @@ python quantization/compare_layers.py --dumps cpp_engine/build/dumps_pc \
 bash cpp_engine/run_both.sh
 python quantization/eval_map.py --csv cpp_engine/build/preds_pc/detections.csv
 python benchmarks/run_all_benchmarks.py             # compare against the libraries
+python docs/make_speedup_chart.py                   # redraw the charts above
 
 cd cpp_engine/build
 ./custom_engine ../../fire.jpg                      # vectorized, the default
