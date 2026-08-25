@@ -7,6 +7,10 @@
 #include "model.h"
 #include "tensor.h"
 
+// Choose which convolution implementation runs. Call once, after the model's
+// weights have been prepared with prepare_kernel().
+void set_kernel(Kernel k);
+
 // ---------------------------------------------------------------------------
 // Core convolution
 //

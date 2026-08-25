@@ -2,10 +2,22 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
+#include <vector>
+
+// AVX-VNNI is reached through intrinsics, which are not a library: each one
+// compiles to a single machine instruction the CPU already has. Nothing is
+// linked and nothing is installed. The header ships with the compiler.
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#include <immintrin.h>
+#define ENGINE_HAS_VNNI 1
+#else
+#define ENGINE_HAS_VNNI 0
+#endif
 
 namespace {
 
@@ -20,9 +32,17 @@ inline float silu(float x) {
     return x / (1.0f + std::exp(-x));
 }
 
-// Shared INT8 convolution core. Produces real-valued (dequantized) outputs with
-// folded BatchNorm and the optional activation already applied.
-FloatTensor conv2d_real(const Tensor& input, const Layer& layer, bool apply_silu) {
+// Which kernel conv2d_real dispatches to. Set once at startup.
+Kernel g_kernel = Kernel::ScalarInt8;
+
+// The original scalar INT8 core. One multiply-accumulate per iteration, which
+// is the whole reason quantization buys no speed on its own: an 8-bit multiply
+// and a 32-bit multiply both retire in about a cycle, so narrowing the numbers
+// without widening the instruction changes nothing.
+//
+// Produces real-valued (dequantized) outputs with folded BatchNorm and the
+// optional activation already applied.
+FloatTensor conv_scalar_int8(const Tensor& input, const Layer& layer, bool apply_silu) {
     const int in_ch = input.shape[0];
     const int in_h = input.shape[1];
     const int in_w = input.shape[2];
@@ -89,6 +109,246 @@ FloatTensor conv2d_real(const Tensor& input, const Layer& layer, bool apply_silu
     }
 
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// FP32 baseline
+//
+// Deliberately the same loop as conv_scalar_int8: same order, same bounds
+// checks, same memory access pattern. Only the arithmetic width changes, so a
+// difference in runtime is attributable to that and nothing else.
+//
+// The weights are the INT8 weights dequantized, not the original FP32 ones.
+// For a latency measurement those are the same thing, identical instruction
+// count and identical memory traffic, and it keeps the numerics comparable.
+// ---------------------------------------------------------------------------
+FloatTensor conv_scalar_fp32(const Tensor& input, const Layer& layer, bool apply_silu) {
+    const int in_ch = input.shape[0];
+    const int in_h = input.shape[1];
+    const int in_w = input.shape[2];
+
+    const int out_ch = layer.weight_shape[0];
+    const int kh = layer.weight_shape[2];
+    const int kw = layer.weight_shape[3];
+
+    const int stride = layer.stride;
+    const int pad = layer.padding;
+    const int out_h = (in_h + 2 * pad - kh) / stride + 1;
+    const int out_w = (in_w + 2 * pad - kw) / stride + 1;
+
+    FloatTensor out({out_ch, out_h, out_w});
+
+    // Dequantize the activations once per convolution. This is O(elements),
+    // negligible beside the O(elements * out_ch * kh * kw) convolution itself.
+    static std::vector<float> in_f;
+    if (in_f.size() < input.num_elements) in_f.resize(input.num_elements);
+    for (size_t i = 0; i < input.num_elements; i++) in_f[i] = input.real_at(i);
+
+    const float* w_all = layer.weights_fp32.data();
+
+    for (int oc = 0; oc < out_ch; oc++) {
+        // The weights already carry their scale, so only the BatchNorm gain is
+        // left to apply.
+        const float gain = layer.bn_gain[oc];
+        const float bias = layer.bn_bias[oc];
+        const float* w_oc = w_all + static_cast<size_t>(oc) * in_ch * kh * kw;
+
+        for (int oh = 0; oh < out_h; oh++) {
+            for (int ow = 0; ow < out_w; ow++) {
+                float acc = 0.0f;
+
+                for (int ic = 0; ic < in_ch; ic++) {
+                    const float* w_ic = w_oc + static_cast<size_t>(ic) * kh * kw;
+                    const float* in_c = in_f.data() + static_cast<size_t>(ic) * in_h * in_w;
+
+                    for (int r = 0; r < kh; r++) {
+                        const int ih = oh * stride + r - pad;
+                        if (ih < 0 || ih >= in_h) continue;
+
+                        for (int c = 0; c < kw; c++) {
+                            const int iw = ow * stride + c - pad;
+                            if (iw < 0 || iw >= in_w) continue;
+
+                            acc += in_c[ih * in_w + iw] * w_ic[r * kw + c];
+                        }
+                    }
+                }
+
+                float value = gain * acc + bias;
+                if (apply_silu) value = silu(value);
+                out.data[(static_cast<size_t>(oc) * out_h + oh) * out_w + ow] = value;
+            }
+        }
+    }
+
+    return out;
+}
+
+#if ENGINE_HAS_VNNI
+
+// Only the vector kernel below is compiled for AVX-VNNI. The rest of this file,
+// including the two scalar kernels it gets measured against, keeps the
+// project's baseline codegen.
+//
+// This matters for the measurement, not just for portability. Passing -mavx2
+// to the whole build would let the compiler quietly vectorise the scalar
+// kernels too, and the comparison would then be between two vectorised loops
+// rather than between a scalar loop and a vector one.
+#pragma GCC push_options
+#pragma GCC target("avx2,avxvnni")
+
+inline int32_t hsum(__m256i v) {
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));
+    return _mm_cvtsi128_si32(s);
+}
+
+inline int32_t hsum(__m128i s) {
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));
+    return _mm_cvtsi128_si32(s);
+}
+
+// ---------------------------------------------------------------------------
+// INT8 through AVX-VNNI
+//
+// VPDPBUSD multiplies 32 unsigned bytes by 32 signed bytes and accumulates the
+// products into 8 int32 lanes, in a single instruction. Two things have to be
+// true before it can be used, and neither of them is about precision:
+//
+//   1. The reduction axis must be contiguous. The engine stores activations as
+//      planar CHW, where consecutive channels sit a whole feature map apart, so
+//      the input is transposed into a padded HWC scratch buffer first. That
+//      costs O(elements) against O(elements * out_ch * kh * kw) of real work.
+//
+//   2. Activations must be unsigned. The instruction is byte-unsigned times
+//      byte-signed, which is exactly why ONNX Runtime quantizes activations to
+//      uint8 and weights to int8. Adding 128 to every stored value converts the
+//      engine's signed activations, and moves the zero point along with them.
+//
+// Zero padding stays exact with no branches in the inner loop: border positions
+// are filled with the shifted zero point so they represent real 0, and the
+// per-channel weight sum subtracted at the end cancels them precisely.
+// ---------------------------------------------------------------------------
+FloatTensor conv_vnni_int8(const Tensor& input, const Layer& layer, bool apply_silu) {
+    const int in_ch = input.shape[0];
+    const int in_h = input.shape[1];
+    const int in_w = input.shape[2];
+
+    const int out_ch = layer.weight_shape[0];
+    const int kh = layer.weight_shape[2];
+    const int kw = layer.weight_shape[3];
+    const int icp = layer.ic_padded;
+
+    const int stride = layer.stride;
+    const int pad = layer.padding;
+    const int out_h = (in_h + 2 * pad - kh) / stride + 1;
+    const int out_w = (in_w + 2 * pad - kw) / stride + 1;
+
+    // Scratch dimensions include the spatial padding, so the inner loop never
+    // has to test whether a tap is in bounds.
+    const int sh = in_h + 2 * pad;
+    const int sw = in_w + 2 * pad;
+
+    // A stored q represents scale * (q - z). Shifting to a = q + 128 gives an
+    // unsigned byte standing for the same number against a zero point of z + 128.
+    const int32_t z_shifted = input.zero_point + 128;
+    const uint8_t z_fill = static_cast<uint8_t>(z_shifted);
+
+    static std::vector<uint8_t> scratch;
+    const size_t need = static_cast<size_t>(sh) * sw * icp;
+    if (scratch.size() < need) scratch.resize(need);
+    std::fill(scratch.begin(), scratch.begin() + need, z_fill);
+
+    // CHW -> padded HWC. Writes run contiguously down the channel axis, which
+    // is the side that matters, since that is what the dot product streams.
+    const size_t plane = static_cast<size_t>(in_h) * in_w;
+    for (int y = 0; y < in_h; y++) {
+        for (int x = 0; x < in_w; x++) {
+            uint8_t* dst = scratch.data() +
+                           (static_cast<size_t>(y + pad) * sw + (x + pad)) * icp;
+            const int8_t* src = input.data + static_cast<size_t>(y) * in_w + x;
+            for (int c = 0; c < in_ch; c++) {
+                dst[c] = static_cast<uint8_t>(static_cast<int>(src[c * plane]) + 128);
+            }
+        }
+    }
+
+    FloatTensor out({out_ch, out_h, out_w});
+
+    // One kernel row is kw taps of icp channels, and consecutive taps are
+    // adjacent in the scratch buffer, so a whole row is one contiguous run.
+    const int row_bytes = kw * icp;
+
+    for (int oc = 0; oc < out_ch; oc++) {
+        const float m = input.scale * layer.weight_scales[oc] * layer.bn_gain[oc];
+        const float bias = layer.bn_bias[oc];
+        // sum((a - z) * w) == sum(a * w) - z * sum(w), and sum(w) is a constant
+        // computed once at load time.
+        const int32_t correction = z_shifted * layer.weight_sums[oc];
+        const int8_t* w_oc = layer.weights_hwc.data() +
+                             static_cast<size_t>(oc) * kh * row_bytes;
+
+        for (int oh = 0; oh < out_h; oh++) {
+            const int ih0 = oh * stride;
+
+            for (int ow = 0; ow < out_w; ow++) {
+                const int iw0 = ow * stride;
+
+                __m256i acc8 = _mm256_setzero_si256();
+                __m128i acc4 = _mm_setzero_si128();
+
+                for (int r = 0; r < kh; r++) {
+                    const uint8_t* a = scratch.data() +
+                                       (static_cast<size_t>(ih0 + r) * sw + iw0) * icp;
+                    const int8_t* w = w_oc + static_cast<size_t>(r) * row_bytes;
+
+                    int i = 0;
+                    for (; i + 32 <= row_bytes; i += 32) {
+                        acc8 = _mm256_dpbusd_avx_epi32(
+                            acc8,
+                            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i)),
+                            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + i)));
+                    }
+                    // Channel counts are multiples of 16, so at most one
+                    // 16-byte step is ever left over. The 128-bit form takes it.
+                    for (; i + 16 <= row_bytes; i += 16) {
+                        acc4 = _mm_dpbusd_avx_epi32(
+                            acc4,
+                            _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i)),
+                            _mm_loadu_si128(reinterpret_cast<const __m128i*>(w + i)));
+                    }
+                }
+
+                const int32_t acc = hsum(acc8) + hsum(acc4) - correction;
+
+                float value = m * static_cast<float>(acc) + bias;
+                if (apply_silu) value = silu(value);
+                out.data[(static_cast<size_t>(oc) * out_h + oh) * out_w + ow] = value;
+            }
+        }
+    }
+
+    return out;
+}
+
+#pragma GCC pop_options
+
+#endif  // ENGINE_HAS_VNNI
+
+// Dispatch to the selected kernel. Layers the vector path cannot serve, which
+// is only layer 0 with its 3 input channels, fall back to the scalar one.
+FloatTensor conv2d_real(const Tensor& input, const Layer& layer, bool apply_silu) {
+    if (g_kernel == Kernel::ScalarFp32 && !layer.weights_fp32.empty()) {
+        return conv_scalar_fp32(input, layer, apply_silu);
+    }
+#if ENGINE_HAS_VNNI
+    if (g_kernel == Kernel::VnniInt8 && !layer.weights_hwc.empty()) {
+        return conv_vnni_int8(input, layer, apply_silu);
+    }
+#endif
+    return conv_scalar_int8(input, layer, apply_silu);
 }
 
 float iou(const Detection& a, const Detection& b) {
@@ -497,3 +757,5 @@ std::vector<Detection> run_inference(const Model& model, const Tensor& input,
     auto features = run_backbone(model, input);
     return detect_head(model, features, conf_threshold, iou_threshold);
 }
+
+void set_kernel(Kernel k) { g_kernel = k; }

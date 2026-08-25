@@ -5,6 +5,7 @@
 //   ./custom_engine --input-bin test_input.bin --dump-dir dumps
 //                                              layer-parity validation mode
 //   ./custom_engine image.jpg --bench 5        time the forward pass
+//   ./custom_engine image.jpg --kernel vnni     pick the convolution kernel
 //
 // Model files are found automatically in ../../quantization/, preferring the
 // more accurate per-channel model, and can be overridden with --model-json and
@@ -40,6 +41,7 @@ struct Options {
     float conf = 0.25f;
     float iou = 0.45f;
     int bench = 0;
+    Kernel kernel = Kernel::VnniInt8;
 };
 
 bool file_exists(const std::string& p) {
@@ -96,6 +98,10 @@ void print_usage() {
         "      --input-bin <path>  use a pre-quantized 3x640x640 INT8 input\n"
         "      --dump-dir <dir>    write each layer's INT8 output for validation\n"
         "      --bench <n>         run the forward pass n extra times and report timing\n"
+        "      --kernel <name>     convolution kernel (default vnni-int8):\n"
+        "                            scalar-int8  one INT8 multiply at a time\n"
+        "                            scalar-fp32  the same loop in FP32\n"
+        "                            vnni-int8    INT8 via AVX-VNNI, 32 per instruction\n"
         "      --model-json <path> / --model-bin <path>\n";
 }
 
@@ -116,6 +122,13 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--csv") o.csv = next("--csv");
         else if (a == "--csv-append") { o.csv = next("--csv-append"); o.csv_append = true; }
         else if (a == "--bench") o.bench = std::stoi(next("--bench"));
+        else if (a == "--kernel") {
+            const std::string name = next("--kernel");
+            if (!parse_kernel(name, o.kernel)) {
+                throw std::runtime_error("Unknown kernel: " + name +
+                                         " (want scalar-int8, scalar-fp32 or vnni-int8)");
+            }
+        }
         else if (a == "--model-json") o.model_json = next("--model-json");
         else if (a == "--model-bin") o.model_bin = next("--model-bin");
         else if (!a.empty() && a[0] == '-') throw std::runtime_error("Unknown option: " + a);
@@ -180,6 +193,17 @@ int main(int argc, char** argv) {
         Model model = load_model_metadata(opt.model_json);
         load_model_weights(model, opt.model_bin);
         const std::vector<std::string> class_names = read_class_names(opt.model_json);
+
+        // AVX-VNNI is not on every x86 CPU, so fall back rather than crash with
+        // an illegal instruction on a machine that lacks it.
+        if (opt.kernel == Kernel::VnniInt8 && !vnni_supported()) {
+            std::cerr << "This CPU has no AVX-VNNI; falling back to scalar-int8"
+                      << std::endl;
+            opt.kernel = Kernel::ScalarInt8;
+        }
+        prepare_kernel(model, opt.kernel);
+        set_kernel(opt.kernel);
+        std::cout << "Kernel: " << kernel_name(opt.kernel) << std::endl;
 
         // Build the INT8 input, either from an image or a pre-quantized blob.
         std::unique_ptr<Tensor> input;

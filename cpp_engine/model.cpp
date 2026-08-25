@@ -133,3 +133,115 @@ void load_model_weights(Model& model, const std::string& bin_path) {
     std::cout << "Loaded weights for " << model.conv_layers.size() << " conv layers"
               << std::endl;
 }
+
+// ---------------------------------------------------------------------------
+// Kernel selection and the weight layouts each kernel needs
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// VPDPBUSD reads 32 bytes per operand in its 256-bit form and 16 in its
+// 128-bit form, so input channels are padded up to a multiple of 16 and the
+// dot product uses whichever width fits. Every channel count in YOLOv8n is
+// already a multiple of 16 except layer 0, which has 3, so in practice this
+// padding costs nothing.
+constexpr int kChannelAlign = 16;
+
+// Below this many input channels the padding would cost more than the
+// vectorisation saves, so those layers stay on the scalar kernel. Only layer 0
+// falls in this bucket.
+constexpr int kMinVnniChannels = 16;
+
+inline int round_up(int v, int m) { return ((v + m - 1) / m) * m; }
+
+}  // namespace
+
+const char* kernel_name(Kernel k) {
+    switch (k) {
+        case Kernel::ScalarInt8: return "scalar-int8";
+        case Kernel::ScalarFp32: return "scalar-fp32";
+        case Kernel::VnniInt8:   return "vnni-int8";
+    }
+    return "unknown";
+}
+
+bool parse_kernel(const std::string& name, Kernel& out) {
+    if (name == "scalar-int8" || name == "int8") { out = Kernel::ScalarInt8; return true; }
+    if (name == "scalar-fp32" || name == "fp32") { out = Kernel::ScalarFp32; return true; }
+    if (name == "vnni-int8"   || name == "vnni") { out = Kernel::VnniInt8;   return true; }
+    return false;
+}
+
+bool vnni_supported() {
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avxvnni") != 0;
+#else
+    return false;
+#endif
+}
+
+void prepare_kernel(Model& model, Kernel k) {
+    if (k == Kernel::ScalarInt8) return;  // runs straight off the loaded blob
+
+    size_t vnni_layers = 0;
+
+    for (Layer& layer : model.conv_layers) {
+        const int oc = layer.weight_shape[0];
+        const int ic = layer.weight_shape[1];
+        const int kh = layer.weight_shape[2];
+        const int kw = layer.weight_shape[3];
+        const int8_t* w = layer.weights->data;
+        const size_t per_oc = static_cast<size_t>(ic) * kh * kw;
+
+        if (k == Kernel::ScalarFp32) {
+            if (!layer.weights_fp32.empty()) continue;
+            layer.weights_fp32.resize(static_cast<size_t>(oc) * per_oc);
+            // Dequantize with the same per-channel scale the INT8 path folds
+            // into its requant multiplier, so both kernels compute the same
+            // numbers and any timing difference is arithmetic width alone.
+            for (int o = 0; o < oc; o++) {
+                const float s = layer.weight_scales[o];
+                const size_t base = static_cast<size_t>(o) * per_oc;
+                for (size_t i = 0; i < per_oc; i++) {
+                    layer.weights_fp32[base + i] = s * static_cast<float>(w[base + i]);
+                }
+            }
+            continue;
+        }
+
+        // VnniInt8: repack [oc][ic][kh][kw] -> [oc][kh][kw][ic_padded].
+        if (!layer.weights_hwc.empty()) continue;
+        if (ic < kMinVnniChannels) continue;  // left on the scalar kernel
+
+        const int icp = round_up(ic, kChannelAlign);
+        layer.ic_padded = icp;
+        layer.weights_hwc.assign(static_cast<size_t>(oc) * kh * kw * icp, 0);
+        layer.weight_sums.assign(static_cast<size_t>(oc), 0);
+
+        for (int o = 0; o < oc; o++) {
+            int32_t sum = 0;
+            for (int r = 0; r < kh; r++) {
+                for (int c = 0; c < kw; c++) {
+                    const size_t dst = ((static_cast<size_t>(o) * kh + r) * kw + c) * icp;
+                    for (int i = 0; i < ic; i++) {
+                        const int8_t v =
+                            w[((static_cast<size_t>(o) * ic + i) * kh + r) * kw + c];
+                        layer.weights_hwc[dst + i] = v;
+                        sum += v;
+                    }
+                }
+            }
+            // Padded channels hold weight 0 and so add nothing here, which is
+            // what makes the padding invisible to the zero-point correction.
+            layer.weight_sums[o] = sum;
+        }
+        vnni_layers++;
+    }
+
+    if (k == Kernel::VnniInt8) {
+        std::cout << "Repacked " << vnni_layers << " of " << model.conv_layers.size()
+                  << " conv layers for AVX-VNNI"
+                  << " (the rest have too few channels and stay scalar)" << std::endl;
+    }
+}
