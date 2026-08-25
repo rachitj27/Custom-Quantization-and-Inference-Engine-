@@ -32,7 +32,6 @@ Red for fire, blue for smoke, with the class and confidence drawn on the box. Bo
 
 - Converting weights to 8 bit, both per-tensor and per-channel
 - Measuring the range of every activation in the network by running calibration images through it and recording what actually flows through each layer
-- Folding BatchNorm into the convolution so it costs nothing at runtime
 - Integer accumulation with the requantization arithmetic that converts back to real values
 
 **M3, the C++ engine.** Loads the quantized model and runs it end to end.
